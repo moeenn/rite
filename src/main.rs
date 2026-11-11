@@ -37,6 +37,8 @@ fn main() -> iced::Result {
 
 /// Everything that belongs to one open file.
 struct Doc {
+    /// Unique per document, used to refresh syntax highlighting on tab switches.
+    id: u64,
     content: Content,
     path: Option<PathBuf>,
     dirty: bool,
@@ -50,7 +52,9 @@ struct Doc {
 
 impl Doc {
     fn empty() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             content: Content::new(),
             path: None,
             dirty: false,
@@ -127,10 +131,14 @@ enum Message {
     Opened(Option<PathBuf>),
     NewTab,
     CloseTab(usize),
+    /// The unsaved document with this id may be closed.
+    CloseConfirmed(u64),
+    Noop,
     SwitchTab(usize),
     CycleTab(bool),
     Enter,
     Indent(bool),
+    MoveLine(bool),
     SelectNext,
     DeleteWord,
     Undo,
@@ -252,6 +260,10 @@ impl Rite {
                 self.shift_indent(indent);
                 return self.reveal_cursor();
             }
+            Message::MoveLine(up) => {
+                self.move_lines(up);
+                return self.reveal_cursor();
+            }
             Message::SelectNext => {
                 self.select_next();
                 return self.reveal_cursor();
@@ -283,6 +295,16 @@ impl Rite {
             }
             Message::NewTab => return self.add_tab(Doc::empty()),
             Message::CloseTab(i) => return self.close_tab(i),
+            Message::Noop => {}
+            Message::CloseConfirmed(id) => {
+                let index = (0..self.tabs.len()).find(|&i| {
+                    let doc = if i == self.active { &self.doc } else { &self.tabs[i] };
+                    doc.id == id
+                });
+                if let Some(i) = index {
+                    return self.force_close_tab(i);
+                }
+            }
             Message::SwitchTab(i) => return self.switch_to(i),
             Message::CycleTab(forward) => {
                 let n = self.tabs.len();
@@ -471,6 +493,95 @@ impl Rite {
         self.mark_dirty();
     }
 
+    /// Alt+Up / Alt+Down: moves the selected lines (or the current line) past
+    /// their neighbour and re-indents them to fit their new surroundings.
+    fn move_lines(&mut self, up: bool) {
+        if !self.doc.extras.is_empty() {
+            return;
+        }
+        let cur = self.doc.content.cursor();
+        let anchor = cur.selection.unwrap_or(cur.position);
+        let key = |p: &Position| (p.line, p.column);
+        let (lo, hi) = if key(&anchor) <= key(&cur.position) {
+            (anchor, cur.position)
+        } else {
+            (cur.position, anchor)
+        };
+        let mut last = hi.line;
+        if hi.column == 0 && hi.line > lo.line {
+            last -= 1;
+        }
+        let first = lo.line;
+        let count = self.doc.content.line_count();
+        if (up && first == 0) || (!up && last + 1 >= count) {
+            return;
+        }
+        self.record(EditKind::Other);
+
+        let mut texts: Vec<String> = Vec::with_capacity(count);
+        let mut endings: Vec<&'static str> = Vec::with_capacity(count);
+        for line in self.doc.content.lines() {
+            texts.push(line.text.to_string());
+            endings.push(line.ending.as_str());
+        }
+
+        // Swap the neighbour across the block; line endings stay where they are.
+        let (new_first, new_last) = if up {
+            let moved = texts.remove(first - 1);
+            texts.insert(last, moved);
+            (first - 1, last - 1)
+        } else {
+            let moved = texts.remove(last + 1);
+            texts.insert(first, moved);
+            (first + 1, last + 1)
+        };
+
+        // Indent the block like the code above it: one level deeper after an
+        // opening bracket or colon, one level less when it starts by closing one.
+        let leading = |t: &str| t.chars().take_while(|c| *c == ' ').count();
+        let above = texts[..new_first].iter().rev().find(|t| !t.trim().is_empty());
+        let mut target = above.map_or(0, |t| {
+            let opens = t.trim_end().ends_with(['{', '(', '[', ':']);
+            leading(t) + if opens { TAB_WIDTH } else { 0 }
+        });
+        let head = texts[new_first..=new_last].iter().find(|t| !t.trim().is_empty());
+        let current = head.map_or(0, |t| leading(t));
+        if head.is_some_and(|t| t.trim_start().starts_with(['}', ')', ']'])) {
+            target = target.saturating_sub(TAB_WIDTH);
+        }
+
+        let mut shift = vec![0isize; texts.len()];
+        for i in new_first..=new_last {
+            if texts[i].trim().is_empty() {
+                continue;
+            }
+            if target >= current {
+                let n = target - current;
+                texts[i].insert_str(0, &" ".repeat(n));
+                shift[i] = n as isize;
+            } else {
+                let n = (current - target).min(leading(&texts[i]));
+                texts[i].drain(..n);
+                shift[i] = -(n as isize);
+            }
+        }
+
+        let mut text = String::new();
+        for (t, e) in texts.iter().zip(&endings) {
+            text.push_str(t);
+            text.push_str(e);
+        }
+
+        let adjust = |p: Position| {
+            let line = if up { p.line - 1 } else { p.line + 1 };
+            Position { line, column: (p.column as isize + shift[line]).max(0) as usize }
+        };
+        let (position, selection) = (adjust(cur.position), cur.selection.map(adjust));
+        self.doc.content = Content::with_text(&text);
+        self.doc.content.move_to(Cursor { position, selection });
+        self.mark_dirty();
+    }
+
     /// The editor is laid out at its full height inside a scrollable, so keep
     /// the cursor line in view ourselves.
     fn reveal_cursor(&mut self) -> Task<Message> {
@@ -543,7 +654,37 @@ impl Rite {
         self.switch_to(self.tabs.len() - 1)
     }
 
+    /// Closes a tab, first asking for confirmation when it has unsaved changes.
     fn close_tab(&mut self, index: usize) -> Task<Message> {
+        let Some(doc) = (if index == self.active { Some(&self.doc) } else { self.tabs.get(index) }) else {
+            return Task::none();
+        };
+        if !doc.dirty {
+            return self.force_close_tab(index);
+        }
+        let id = doc.id;
+        let description = format!("\"{}\" has unsaved changes. Closing it will lose them.", doc.name());
+        Task::perform(
+            async move {
+                rfd::AsyncMessageDialog::new()
+                    .set_title("Unsaved changes")
+                    .set_description(description)
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_buttons(rfd::MessageButtons::OkCancelCustom("Close and lose changes".into(), "Cancel".into()))
+                    .show()
+                    .await
+            },
+            move |result| match result {
+                rfd::MessageDialogResult::Custom(label) if label == "Close and lose changes" => {
+                    Message::CloseConfirmed(id)
+                }
+                rfd::MessageDialogResult::Ok => Message::CloseConfirmed(id),
+                _ => Message::Noop,
+            },
+        )
+    }
+
+    fn force_close_tab(&mut self, index: usize) -> Task<Message> {
         if index >= self.tabs.len() {
             return Task::none();
         }
@@ -605,7 +746,7 @@ impl Rite {
             .width(CLOSE_SIZE)
             .height(CLOSE_SIZE)
             .on_press(Message::CloseTab(i))
-            .style(move |_, status| close_style(p, active, status));
+            .style(move |_, status| round_hover_style(tab_style(p, active), Color::from_rgb8(0xe0, 0x3e, 0x3e), status));
             bar = bar.push(
                 container(row![tab, close].spacing(10).align_y(alignment::Vertical::Center))
                     .padding(Padding { top: 10.0, right: 4.0, bottom: 10.0, left: 16.0 })
@@ -615,9 +756,31 @@ impl Rite {
                     }),
             );
         }
-        container(scrollable(bar).direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(0).scroller_width(0),
-        )))
+        let tabs = scrollable(bar)
+            .width(Length::Fill)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ));
+        let plus = iced::widget::button(
+            text("+")
+                .size(20)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center),
+        )
+        .padding(0)
+        .width(CLOSE_SIZE)
+        .height(CLOSE_SIZE)
+        .on_press(Message::NewTab)
+        .style(move |_, status| round_hover_style(tab_style(p, false), Color::WHITE, status));
+
+        container(
+            row![tabs, plus]
+                .spacing(8)
+                .align_y(alignment::Vertical::Center),
+        )
+        .padding(Padding::ZERO.right(8))
         .width(Length::Fill)
         .style(|_| container::Style {
             background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.3))),
@@ -654,6 +817,12 @@ impl Rite {
             Space::new().height(past_end),
         ];
 
+        let first_line = self.doc.content.line(0).map(|l| l.text.to_string()).unwrap_or_default();
+        let hl_settings = highlight::Settings {
+            palette: p,
+            lang: highlight::detect(self.doc.path.as_deref(), &first_line),
+            doc_id: self.doc.id,
+        };
         let selecting = self.doc.content.selection().is_some();
         let close_index = self.active;
         let editor = text_editor_widget(&self.doc.content)
@@ -674,7 +843,17 @@ impl Rite {
                     }
                     (Key::Named(Named::Backspace), true) => Some(Binding::Custom(Message::DeleteWord)),
                     (Key::Character(c), true) if c.as_str() == "d" => Some(Binding::Custom(Message::SelectNext)),
+                    (Key::Named(Named::ArrowUp), _) if press.modifiers.alt() => {
+                        Some(Binding::Custom(Message::MoveLine(true)))
+                    }
+                    (Key::Named(Named::ArrowDown), _) if press.modifiers.alt() => {
+                        Some(Binding::Custom(Message::MoveLine(false)))
+                    }
                     (Key::Named(Named::Enter), false) => Some(Binding::Custom(Message::Enter)),
+                    (Key::Character(c), _) if press.modifiers.alt() && c.len() == 1 && c.as_bytes()[0] >= b'1' && c.as_bytes()[0] <= b'9' => {
+                        Some(Binding::Custom(Message::SwitchTab((c.as_bytes()[0] - b'1') as usize)))
+                    }
+                    (Key::Character(c), true) if c.as_str() == "n" => Some(Binding::Custom(Message::NewTab)),
                     (Key::Named(Named::Tab), true) => Some(Binding::Custom(Message::CycleTab(!press.modifiers.shift()))),
                     (Key::Character(c), true) if c.as_str() == "t" => Some(Binding::Custom(Message::NewTab)),
                     (Key::Character(c), true) if c.as_str() == "o" => Some(Binding::Custom(Message::Open)),
@@ -693,7 +872,7 @@ impl Rite {
                     _ => Binding::from_key_press(press),
                 }
             })
-            .highlight_with::<highlight::Syntax>(p, highlight::format)
+            .highlight_with::<highlight::Syntax>(hl_settings, highlight::format)
             .style(move |_, _| text_editor::Style {
                 background: iced::Background::Color(iced::Color::TRANSPARENT),
                 border: iced::Border::default(),
@@ -1039,17 +1218,21 @@ fn tab_style(p: Palette, active: bool) -> iced::widget::button::Style {
     }
 }
 
-/// The close button turns into a red disc with a black cross while hovered.
-fn close_style(p: Palette, active: bool, status: iced::widget::button::Status) -> iced::widget::button::Style {
+/// While hovered the button becomes a filled disc of `hover` with a black label.
+fn round_hover_style(
+    base: iced::widget::button::Style,
+    hover: Color,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
     use iced::widget::button::Status;
     if matches!(status, Status::Hovered | Status::Pressed) {
         iced::widget::button::Style {
-            background: Some(iced::Background::Color(Color::from_rgb8(0xe0, 0x3e, 0x3e))),
+            background: Some(iced::Background::Color(hover)),
             text_color: Color::BLACK,
             border: iced::Border { radius: (CLOSE_SIZE / 2.0).into(), ..Default::default() },
             ..Default::default()
         }
     } else {
-        tab_style(p, active)
+        base
     }
 }
