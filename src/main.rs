@@ -56,7 +56,6 @@ struct Doc {
     path: Option<PathBuf>,
     dirty: bool,
     offset_y: f32,
-    offset_x: f32,
     /// Additional cursors as (anchor, head) byte offsets into the document.
     extras: Vec<(usize, usize)>,
     undo: Vec<Snapshot>,
@@ -73,7 +72,6 @@ impl Doc {
             path: None,
             dirty: false,
             offset_y: 0.0,
-            offset_x: 0.0,
             extras: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -115,7 +113,6 @@ struct Rite {
     font: Font,
     palette: Palette,
     scroll_id: Id,
-    hscroll_id: Id,
     editor_id: Id,
     search_id: Id,
     /// The find bar is shown while this is `Some`.
@@ -148,7 +145,6 @@ const UNDO_LIMIT: usize = 200;
 enum Message {
     Edit(Action),
     Scrolled(f32),
-    ScrolledX(f32),
     Wheel(iced::mouse::ScrollDelta),
     /// Files to open, from a drop or another `rite` invocation.
     Remote(Vec<PathBuf>, Option<String>),
@@ -212,7 +208,6 @@ impl Rite {
             config,
             palette,
             scroll_id: Id::new("rite-scroll"),
-            hscroll_id: Id::new("rite-hscroll"),
             editor_id: Id::new("rite-editor"),
             search_id: Id::new("rite-search"),
             search: None,
@@ -250,11 +245,38 @@ impl Rite {
         digits * self.size_px() * 0.62 + GUTTER_PAD * 2.0
     }
 
-    /// Width of the editor: wide enough for the longest line, never narrower than the window.
+    /// Width of the editor: whatever the gutter leaves of the window.
     fn editor_w(&self) -> f32 {
-        let longest = self.doc.content.lines().map(|l| l.text.chars().count()).max().unwrap_or(0);
-        let text = longest as f32 * self.char_px() + TEXT_PAD * 2.0 + self.char_px() * 4.0;
-        text.max(self.viewport_w - self.gutter_w())
+        (self.viewport_w - self.gutter_w()).max(self.char_px() * 4.0)
+    }
+
+    /// Characters that fit on one visual row.
+    fn cols(&self) -> usize {
+        (((self.editor_w() - TEXT_PAD * 2.0) / self.char_px()).floor() as usize).max(1)
+    }
+
+    /// First visual row of every line, plus the total row count as a last entry.
+    fn row_starts(&self) -> Vec<usize> {
+        let cols = self.cols();
+        let mut starts = Vec::with_capacity(self.doc.content.line_count() + 1);
+        let mut row = 0;
+        for l in self.doc.content.lines() {
+            starts.push(row);
+            row += l.text.chars().count().div_ceil(cols).max(1);
+        }
+        starts.push(row);
+        starts
+    }
+
+    /// Visual row holding the cursor.
+    fn cursor_row(&self, starts: &[usize]) -> usize {
+        let pos = self.doc.content.cursor().position;
+        let col = self
+            .doc
+            .content
+            .line(pos.line)
+            .map_or(0, |l| l.text[..pos.column.min(l.text.len())].chars().count());
+        starts[pos.line.min(starts.len() - 2)] + col / self.cols()
     }
 
     fn line_px(&self) -> f32 {
@@ -368,43 +390,22 @@ impl Rite {
                     self.doc.offset_y = y;
                 }
             }
-            Message::ScrolledX(x) => {
-                if self.last_wheel.elapsed() > WHEEL_ECHO {
-                    self.doc.offset_x = x;
-                }
-            }
             Message::Wheel(delta) => {
-                let (dx, dy) = match delta {
-                    iced::mouse::ScrollDelta::Lines { x, y } => {
-                        let (x, y) = if self.shift { (y, x) } else { (x, y) };
-                        (-x * 60.0 * SCROLL_SPEED, -y * 60.0 * SCROLL_SPEED)
-                    }
-                    iced::mouse::ScrollDelta::Pixels { x, y } => {
-                        let (x, y) = if self.shift { (y, x) } else { (x, y) };
-                        (-x * SCROLL_SPEED, -y * SCROLL_SPEED)
-                    }
+                let dy = match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. } => -y * 60.0 * SCROLL_SPEED,
+                    iced::mouse::ScrollDelta::Pixels { y, .. } => -y * SCROLL_SPEED,
                 };
                 self.last_wheel = std::time::Instant::now();
-                let mut tasks = Vec::new();
                 if dy != 0.0 {
-                    let max = (self.doc.content.line_count() as f32 - 1.0) * self.line_px();
+                    let rows = *self.row_starts().last().unwrap_or(&1);
+                    let max = (rows as f32 - 1.0) * self.line_px();
                     let target = (self.doc.offset_y + dy).clamp(0.0, max.max(0.0));
                     self.doc.offset_y = target;
-                    tasks.push(iced::widget::operation::scroll_to(
+                    return iced::widget::operation::scroll_to(
                         self.scroll_id.clone(),
                         scrollable::AbsoluteOffset { x: None, y: Some(target) },
-                    ));
+                    );
                 }
-                if dx != 0.0 {
-                    let max = self.editor_w() - (self.viewport_w - self.gutter_w());
-                    let target = (self.doc.offset_x + dx).clamp(0.0, max.max(0.0));
-                    self.doc.offset_x = target;
-                    tasks.push(iced::widget::operation::scroll_to(
-                        self.hscroll_id.clone(),
-                        scrollable::AbsoluteOffset { x: Some(target), y: None },
-                    ));
-                }
-                return Task::batch(tasks);
             }
             Message::Remote(paths, token) => {
                 let mut tasks: Vec<Task<Message>> = paths.into_iter().map(|p| self.open_path(p)).collect();
@@ -633,16 +634,15 @@ impl Rite {
 
         // Put the match line in the middle of the viewport.
         let lh = self.line_px();
-        let max = (self.doc.content.line_count() as f32 - 1.0) * lh;
-        let target = (line as f32 * lh + lh / 2.0 - self.viewport_h / 2.0).clamp(0.0, max.max(0.0));
+        let starts = self.row_starts();
+        let max = (starts[starts.len() - 1] as f32 - 1.0) * lh;
+        let row = starts[line] + m.start / self.cols();
+        let target = (row as f32 * lh + lh / 2.0 - self.viewport_h / 2.0).clamp(0.0, max.max(0.0));
         self.doc.offset_y = target;
-        Task::batch([
-            iced::widget::operation::scroll_to(
-                self.scroll_id.clone(),
-                scrollable::AbsoluteOffset { x: None, y: Some(target) },
-            ),
-            self.reveal_cursor_x(),
-        ])
+        iced::widget::operation::scroll_to(
+            self.scroll_id.clone(),
+            scrollable::AbsoluteOffset { x: None, y: Some(target) },
+        )
     }
 
     /// Tab / Shift+Tab over the selected lines (or the current line).
@@ -788,15 +788,11 @@ impl Rite {
         self.mark_dirty();
     }
 
-    /// The editor is laid out at its full size inside scrollables, so keep
+    /// The editor is laid out at its full size inside a scrollable, so keep
     /// the cursor in view ourselves.
     fn reveal_cursor(&mut self) -> Task<Message> {
-        Task::batch([self.reveal_cursor_y(), self.reveal_cursor_x()])
-    }
-
-    fn reveal_cursor_y(&mut self) -> Task<Message> {
         let lh = self.line_px();
-        let top = self.doc.content.cursor().position.line as f32 * lh;
+        let top = self.cursor_row(&self.row_starts()) as f32 * lh;
         let bottom = top + lh;
         let target = if top < self.doc.offset_y {
             top
@@ -809,31 +805,6 @@ impl Rite {
         iced::widget::operation::scroll_to(
             self.scroll_id.clone(),
             scrollable::AbsoluteOffset { x: None, y: Some(target) },
-        )
-    }
-
-    fn reveal_cursor_x(&mut self) -> Task<Message> {
-        let pos = self.doc.content.cursor().position;
-        let col = self
-            .doc
-            .content
-            .line(pos.line)
-            .map_or(0, |l| l.text[..pos.column.min(l.text.len())].chars().count());
-        let cw = self.char_px();
-        let margin = cw * 2.0;
-        let x = TEXT_PAD + col as f32 * cw;
-        let view = (self.viewport_w - self.gutter_w()).max(0.0);
-        let target = if x - margin < self.doc.offset_x {
-            (x - margin).max(0.0)
-        } else if x + cw + margin > self.doc.offset_x + view {
-            x + cw + margin - view
-        } else {
-            return Task::none();
-        };
-        self.doc.offset_x = target;
-        iced::widget::operation::scroll_to(
-            self.hscroll_id.clone(),
-            scrollable::AbsoluteOffset { x: Some(target), y: None },
         )
     }
 
@@ -868,16 +839,10 @@ impl Rite {
     }
 
     fn scroll_to_saved(&self) -> Task<Message> {
-        Task::batch([
-            iced::widget::operation::scroll_to(
-                self.scroll_id.clone(),
-                scrollable::AbsoluteOffset { x: None, y: Some(self.doc.offset_y) },
-            ),
-            iced::widget::operation::scroll_to(
-                self.hscroll_id.clone(),
-                scrollable::AbsoluteOffset { x: Some(self.doc.offset_x), y: None },
-            ),
-        ])
+        iced::widget::operation::scroll_to(
+            self.scroll_id.clone(),
+            scrollable::AbsoluteOffset { x: None, y: Some(self.doc.offset_y) },
+        )
     }
 
     fn switch_to(&mut self, index: usize) -> Task<Message> {
@@ -1040,7 +1005,19 @@ impl Rite {
 
         let count = self.doc.content.line_count().max(1);
         let gutter_w = self.gutter_w();
-        let numbers = (1..=count).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
+        let cols = self.cols();
+        let starts = self.row_starts();
+        // Wrapped lines get blank gutter rows after their number.
+        let mut numbers = String::new();
+        for n in 0..count {
+            if n > 0 {
+                numbers.push('\n');
+            }
+            numbers.push_str(&(n + 1).to_string());
+            for _ in 1..starts[n + 1] - starts[n] {
+                numbers.push('\n');
+            }
+        }
 
         let gutter = iced::widget::column![
             container(
@@ -1073,8 +1050,8 @@ impl Rite {
             .padding(Padding { top: 0.0, right: TEXT_PAD, bottom: past_end, left: TEXT_PAD })
             .height(Length::Shrink)
             .id(self.editor_id.clone())
-            // Overlays and the gutter assume one visual row per line.
-            .wrapping(text::Wrapping::None)
+            // Glyph wrapping keeps the row count of a line predictable for the overlays and the gutter.
+            .wrapping(text::Wrapping::Glyph)
             .width(self.editor_w())
             .on_action(Message::Edit)
             .key_binding(move |press| {
@@ -1155,8 +1132,9 @@ impl Rite {
                 selection: p.selection,
             });
 
-        let first = ((self.doc.offset_y / lh) as usize).saturating_sub(1);
-        let last = (((self.doc.offset_y + self.viewport_h) / lh) as usize + 2).min(count);
+        let line_of = |row: usize| starts.partition_point(|&s| s <= row).saturating_sub(1).min(count - 1);
+        let first = line_of((self.doc.offset_y / lh) as usize).saturating_sub(1);
+        let last = (line_of(((self.doc.offset_y + self.viewport_h) / lh) as usize) + 2).min(count);
         let visible = first..last.max(first);
 
         let texts: Vec<String> = self.doc.content.lines().map(|l| l.text.to_string()).collect();
@@ -1210,6 +1188,8 @@ impl Rite {
 
         let guides = Guides {
             first,
+            cols,
+            starts: starts.clone(),
             indents: fill_indents(&texts)[visible].to_vec(),
             matches,
             found,
@@ -1225,16 +1205,8 @@ impl Rite {
         };
         let overlay = canvas(guides).width(Length::Fill).height(Length::Fill);
 
-        // Only the text scrolls sideways; the gutter stays put.
-        let hscroll = scrollable(iced::widget::mouse_area(stack![editor, overlay]).on_scroll(Message::Wheel))
-            .id(self.hscroll_id.clone())
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(0).scroller_width(0),
-            ))
-            .on_scroll(|v| Message::ScrolledX(v.absolute_offset().x))
-            .width(Length::Fill);
         let body = scrollable(
-            iced::widget::mouse_area(row![gutter, hscroll]).on_scroll(Message::Wheel),
+            iced::widget::mouse_area(row![gutter, stack![editor, overlay]]).on_scroll(Message::Wheel),
         )
             .id(self.scroll_id.clone())
             .on_scroll(|v| Message::Scrolled(v.absolute_offset().y))
@@ -1490,6 +1462,10 @@ fn enter_with_indent(content: &mut Content) {
 /// text and extra cursors, drawn over the editor.
 struct Guides {
     first: usize,
+    /// Characters per visual row.
+    cols: usize,
+    /// First visual row of every line, plus the total as a last entry.
+    starts: Vec<usize>,
     indents: Vec<usize>,
     /// (line, start column, length) in characters.
     matches: Vec<(usize, usize, usize)>,
@@ -1520,7 +1496,24 @@ impl<M> canvas::Program<M> for Guides {
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let col_x = |col: usize| self.origin_x + col as f32 * self.char_w;
-        let line_y = |line: usize| line as f32 * self.line_h;
+        let row_y = |row: usize| row as f32 * self.line_h;
+        let cols = self.cols;
+        let last = self.starts.len() - 2;
+        // (x column, y row) of a character column within a line.
+        let at = |line: usize, col: usize| (col % cols, self.starts[line.min(last)] + col / cols);
+        // One rectangle per visual row covered by `len` characters from `col`.
+        let spans = |line: usize, col: usize, len: usize| {
+            let mut out = Vec::new();
+            let (mut c, mut left) = (col, len);
+            while left > 0 {
+                let (x, row) = at(line, c);
+                let n = left.min(cols - x);
+                out.push((x, row, n));
+                c += n;
+                left -= n;
+            }
+            out
+        };
 
         frame.fill_rectangle(
             iced::Point::new((col_x(RULER_COLUMN as usize)).floor() + 0.5, 0.0),
@@ -1538,8 +1531,10 @@ impl<M> canvas::Program<M> for Guides {
                 match (active, run) {
                     (true, None) => run = Some(i),
                     (false, Some(start)) => {
-                        let y = line_y(self.first + start);
-                        let h = (i - start) as f32 * self.line_h;
+                        let from = self.starts[(self.first + start).min(last)];
+                        let to = self.starts[(self.first + i).min(last + 1)];
+                        let y = row_y(from);
+                        let h = (to - from) as f32 * self.line_h;
                         frame.fill_rectangle(iced::Point::new(x, y), Size::new(1.0, h), self.color);
                         run = None;
                     }
@@ -1549,31 +1544,38 @@ impl<M> canvas::Program<M> for Guides {
         }
 
         for &(line, col, len) in &self.matches {
-            frame.fill_rectangle(
-                iced::Point::new(col_x(col), line_y(line)),
-                Size::new(len as f32 * self.char_w, self.line_h),
-                self.highlight,
-            );
+            for (x, row, n) in spans(line, col, len) {
+                frame.fill_rectangle(
+                    iced::Point::new(col_x(x), row_y(row)),
+                    Size::new(n as f32 * self.char_w, self.line_h),
+                    self.highlight,
+                );
+            }
         }
 
         for &(line, col, len) in &self.found {
-            frame.fill_rectangle(
-                iced::Point::new(col_x(col), line_y(line)),
-                Size::new(len as f32 * self.char_w, self.line_h),
-                self.found_color,
-            );
+            for (x, row, n) in spans(line, col, len) {
+                frame.fill_rectangle(
+                    iced::Point::new(col_x(x), row_y(row)),
+                    Size::new(n as f32 * self.char_w, self.line_h),
+                    self.found_color,
+                );
+            }
         }
 
         for &(line, from, to, head_line, head_col) in &self.extras {
             if to > from {
-                frame.fill_rectangle(
-                    iced::Point::new(col_x(from), line_y(line)),
-                    Size::new((to - from) as f32 * self.char_w, self.line_h),
-                    Color { a: 0.3, ..self.cursor },
-                );
+                for (x, row, n) in spans(line, from, to - from) {
+                    frame.fill_rectangle(
+                        iced::Point::new(col_x(x), row_y(row)),
+                        Size::new(n as f32 * self.char_w, self.line_h),
+                        Color { a: 0.3, ..self.cursor },
+                    );
+                }
             }
+            let (hx, hrow) = at(head_line, head_col);
             frame.fill_rectangle(
-                iced::Point::new(col_x(head_col), line_y(head_line)),
+                iced::Point::new(col_x(hx), row_y(hrow)),
                 Size::new(2.0, self.line_h),
                 self.cursor,
             );
