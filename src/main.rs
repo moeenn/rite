@@ -255,28 +255,31 @@ impl Rite {
         (((self.editor_w() - TEXT_PAD * 2.0) / self.char_px()).floor() as usize).max(1)
     }
 
-    /// First visual row of every line, plus the total row count as a last entry.
-    fn row_starts(&self) -> Vec<usize> {
+    /// Where every line wraps at the current width.
+    fn layout(&self) -> Layout {
         let cols = self.cols();
         let mut starts = Vec::with_capacity(self.doc.content.line_count() + 1);
+        let mut breaks = Vec::with_capacity(self.doc.content.line_count());
         let mut row = 0;
         for l in self.doc.content.lines() {
+            let b = wrap_line(&l.text, cols);
             starts.push(row);
-            row += l.text.chars().count().div_ceil(cols).max(1);
+            row += b.len();
+            breaks.push(b);
         }
         starts.push(row);
-        starts
+        Layout { starts, breaks }
     }
 
     /// Visual row holding the cursor.
-    fn cursor_row(&self, starts: &[usize]) -> usize {
+    fn cursor_row(&self, layout: &Layout) -> usize {
         let pos = self.doc.content.cursor().position;
         let col = self
             .doc
             .content
             .line(pos.line)
             .map_or(0, |l| l.text[..pos.column.min(l.text.len())].chars().count());
-        starts[pos.line.min(starts.len() - 2)] + col / self.cols()
+        layout.at(pos.line, col).0
     }
 
     fn line_px(&self) -> f32 {
@@ -397,7 +400,7 @@ impl Rite {
                 };
                 self.last_wheel = std::time::Instant::now();
                 if dy != 0.0 {
-                    let rows = *self.row_starts().last().unwrap_or(&1);
+                    let rows = self.layout().rows();
                     let max = (rows as f32 - 1.0) * self.line_px();
                     let target = (self.doc.offset_y + dy).clamp(0.0, max.max(0.0));
                     self.doc.offset_y = target;
@@ -634,9 +637,9 @@ impl Rite {
 
         // Put the match line in the middle of the viewport.
         let lh = self.line_px();
-        let starts = self.row_starts();
-        let max = (starts[starts.len() - 1] as f32 - 1.0) * lh;
-        let row = starts[line] + m.start / self.cols();
+        let layout = self.layout();
+        let max = (layout.rows() as f32 - 1.0) * lh;
+        let row = layout.at(line, m.start).0;
         let target = (row as f32 * lh + lh / 2.0 - self.viewport_h / 2.0).clamp(0.0, max.max(0.0));
         self.doc.offset_y = target;
         iced::widget::operation::scroll_to(
@@ -792,7 +795,7 @@ impl Rite {
     /// the cursor in view ourselves.
     fn reveal_cursor(&mut self) -> Task<Message> {
         let lh = self.line_px();
-        let top = self.cursor_row(&self.row_starts()) as f32 * lh;
+        let top = self.cursor_row(&self.layout()) as f32 * lh;
         let bottom = top + lh;
         let target = if top < self.doc.offset_y {
             top
@@ -1005,8 +1008,8 @@ impl Rite {
 
         let count = self.doc.content.line_count().max(1);
         let gutter_w = self.gutter_w();
-        let cols = self.cols();
-        let starts = self.row_starts();
+        let layout = self.layout();
+        let starts = &layout.starts;
         // Wrapped lines get blank gutter rows after their number.
         let mut numbers = String::new();
         for n in 0..count {
@@ -1050,8 +1053,8 @@ impl Rite {
             .padding(Padding { top: 0.0, right: TEXT_PAD, bottom: past_end, left: TEXT_PAD })
             .height(Length::Shrink)
             .id(self.editor_id.clone())
-            // Glyph wrapping keeps the row count of a line predictable for the overlays and the gutter.
-            .wrapping(text::Wrapping::Glyph)
+            // `wrap_line` mirrors this wrapping to place the gutter numbers and overlays.
+            .wrapping(text::Wrapping::WordOrGlyph)
             .width(self.editor_w())
             .on_action(Message::Edit)
             .key_binding(move |press| {
@@ -1188,8 +1191,7 @@ impl Rite {
 
         let guides = Guides {
             first,
-            cols,
-            starts: starts.clone(),
+            layout: layout.clone(),
             indents: fill_indents(&texts)[visible].to_vec(),
             matches,
             found,
@@ -1260,6 +1262,72 @@ impl Rite {
             })
             .into()
     }
+}
+
+/// Wrap positions of every line, in visual rows.
+#[derive(Clone)]
+struct Layout {
+    /// First visual row of every line, plus the total row count as a last entry.
+    starts: Vec<usize>,
+    /// Per line, the character column each visual row begins at.
+    breaks: Vec<Vec<usize>>,
+}
+
+impl Layout {
+    fn rows(&self) -> usize {
+        self.starts.last().copied().unwrap_or(1)
+    }
+
+    /// (visual row, column within that row) of a character column.
+    fn at(&self, line: usize, col: usize) -> (usize, usize) {
+        let (row, x, _) = self.at_row_end(line, col);
+        (row, x)
+    }
+
+    /// Like `at`, plus the character column where that visual row ends.
+    fn at_row_end(&self, line: usize, col: usize) -> (usize, usize, usize) {
+        let line = line.min(self.breaks.len().saturating_sub(1));
+        let b = &self.breaks[line];
+        let r = b.partition_point(|&s| s <= col).saturating_sub(1);
+        (self.starts[line] + r, col - b[r], b.get(r + 1).copied().unwrap_or(usize::MAX))
+    }
+}
+
+/// Character columns at which each visual row of `text` begins. Mirrors word
+/// wrapping: a word that doesn't fit moves whole to the next row, one longer
+/// than a row is broken, and spaces after a word may hang past the edge.
+fn wrap_line(text: &str, cols: usize) -> Vec<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut breaks = vec![0];
+    let mut used = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && chars[i] != ' ' {
+            i += 1;
+        }
+        let word = i - start;
+        while i < chars.len() && chars[i] == ' ' {
+            i += 1;
+        }
+        let spaces = i - start - word;
+        if used + word > cols && used > 0 {
+            breaks.push(start);
+            used = 0;
+        }
+        if word > cols {
+            let mut at = start + cols;
+            while at < start + word {
+                breaks.push(at);
+                at += cols;
+            }
+            used = (start + word) - breaks[breaks.len() - 1];
+        } else {
+            used += word;
+        }
+        used += spaces;
+    }
+    breaks
 }
 
 /// Case-insensitive comparison form of `s`, one folded char per input char.
@@ -1462,10 +1530,7 @@ fn enter_with_indent(content: &mut Content) {
 /// text and extra cursors, drawn over the editor.
 struct Guides {
     first: usize,
-    /// Characters per visual row.
-    cols: usize,
-    /// First visual row of every line, plus the total as a last entry.
-    starts: Vec<usize>,
+    layout: Layout,
     indents: Vec<usize>,
     /// (line, start column, length) in characters.
     matches: Vec<(usize, usize, usize)>,
@@ -1497,17 +1562,15 @@ impl<M> canvas::Program<M> for Guides {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let col_x = |col: usize| self.origin_x + col as f32 * self.char_w;
         let row_y = |row: usize| row as f32 * self.line_h;
-        let cols = self.cols;
-        let last = self.starts.len() - 2;
-        // (x column, y row) of a character column within a line.
-        let at = |line: usize, col: usize| (col % cols, self.starts[line.min(last)] + col / cols);
+        let starts = &self.layout.starts;
+        let last = starts.len() - 2;
         // One rectangle per visual row covered by `len` characters from `col`.
         let spans = |line: usize, col: usize, len: usize| {
             let mut out = Vec::new();
             let (mut c, mut left) = (col, len);
             while left > 0 {
-                let (x, row) = at(line, c);
-                let n = left.min(cols - x);
+                let (row, x, end) = self.layout.at_row_end(line, c);
+                let n = left.min(end.saturating_sub(c).max(1));
                 out.push((x, row, n));
                 c += n;
                 left -= n;
@@ -1531,8 +1594,8 @@ impl<M> canvas::Program<M> for Guides {
                 match (active, run) {
                     (true, None) => run = Some(i),
                     (false, Some(start)) => {
-                        let from = self.starts[(self.first + start).min(last)];
-                        let to = self.starts[(self.first + i).min(last + 1)];
+                        let from = starts[(self.first + start).min(last)];
+                        let to = starts[(self.first + i).min(last + 1)];
                         let y = row_y(from);
                         let h = (to - from) as f32 * self.line_h;
                         frame.fill_rectangle(iced::Point::new(x, y), Size::new(1.0, h), self.color);
@@ -1573,7 +1636,7 @@ impl<M> canvas::Program<M> for Guides {
                     );
                 }
             }
-            let (hx, hrow) = at(head_line, head_col);
+            let (hrow, hx) = self.layout.at(head_line, head_col);
             frame.fill_rectangle(
                 iced::Point::new(col_x(hx), row_y(hrow)),
                 Size::new(2.0, self.line_h),
