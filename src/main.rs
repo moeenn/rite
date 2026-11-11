@@ -8,7 +8,7 @@ use config::Config;
 use iced::futures::StreamExt;
 use iced::keyboard::{Key, key::Named};
 use iced::widget::{
-    Id, Space, canvas, container, row, stack, scrollable, text, text_editor as text_editor_widget,
+    Id, Space, canvas, container, row, stack, scrollable, text, text_editor as text_editor_widget, text_input,
     text::LineHeight,
     text_editor::{self, Action, Binding, Content, Cursor, Edit, Motion, Position},
 };
@@ -23,7 +23,9 @@ const GUTTER_PAD: f32 = 20.0;
 const TEXT_PAD: f32 = 12.0;
 const TAB_WIDTH: usize = 4;
 /// Wheel scrolling relative to the scrollable's built-in speed.
-const SCROLL_SPEED: f32 = 1.4;
+const SCROLL_SPEED: f32 = 2.1;
+/// Scroll reports this soon after a wheel event predate it and are ignored.
+const WHEEL_ECHO: std::time::Duration = std::time::Duration::from_millis(150);
 const CLOSE_SIZE: f32 = 24.0;
 const RULER_COLUMN: f32 = 80.0;
 /// Advance width of a monospace glyph, relative to the font size.
@@ -54,6 +56,7 @@ struct Doc {
     path: Option<PathBuf>,
     dirty: bool,
     offset_y: f32,
+    offset_x: f32,
     /// Additional cursors as (anchor, head) byte offsets into the document.
     extras: Vec<(usize, usize)>,
     undo: Vec<Snapshot>,
@@ -70,6 +73,7 @@ impl Doc {
             path: None,
             dirty: false,
             offset_y: 0.0,
+            offset_x: 0.0,
             extras: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -111,7 +115,16 @@ struct Rite {
     font: Font,
     palette: Palette,
     scroll_id: Id,
+    hscroll_id: Id,
+    editor_id: Id,
+    search_id: Id,
+    /// The find bar is shown while this is `Some`.
+    search: Option<String>,
+    shift: bool,
+    /// When the wheel last moved the view; scroll reports right after it are stale echoes.
+    last_wheel: std::time::Instant,
     viewport_h: f32,
+    viewport_w: f32,
 }
 
 /// Document state saved for undo and redo.
@@ -135,6 +148,7 @@ const UNDO_LIMIT: usize = 200;
 enum Message {
     Edit(Action),
     Scrolled(f32),
+    ScrolledX(f32),
     Wheel(iced::mouse::ScrollDelta),
     /// Files to open, from a drop or another `rite` invocation.
     Remote(Vec<PathBuf>, Option<String>),
@@ -157,6 +171,11 @@ enum Message {
     DeleteWord,
     Undo,
     Redo,
+    OpenSearch,
+    CloseSearch,
+    SearchChanged(String),
+    SearchNext,
+    Shift(bool),
 }
 
 impl Rite {
@@ -183,6 +202,7 @@ impl Rite {
         let doc = std::mem::replace(&mut tabs[0], Doc::empty());
 
         let viewport_h = config.window_height;
+        let viewport_w = config.window_width;
         let app = Self {
             font: Self::font_for(&config),
             doc,
@@ -192,7 +212,14 @@ impl Rite {
             config,
             palette,
             scroll_id: Id::new("rite-scroll"),
+            hscroll_id: Id::new("rite-hscroll"),
+            editor_id: Id::new("rite-editor"),
+            search_id: Id::new("rite-search"),
+            search: None,
+            shift: false,
+            last_wheel: std::time::Instant::now(),
             viewport_h,
+            viewport_w,
         };
         (app, Task::none())
     }
@@ -214,6 +241,22 @@ impl Rite {
         self.config.font_size.points() * POINT_TO_PIXEL
     }
 
+    fn char_px(&self) -> f32 {
+        self.size_px() * CHAR_WIDTH
+    }
+
+    fn gutter_w(&self) -> f32 {
+        let digits = self.doc.content.line_count().max(1).to_string().len().max(2) as f32;
+        digits * self.size_px() * 0.62 + GUTTER_PAD * 2.0
+    }
+
+    /// Width of the editor: wide enough for the longest line, never narrower than the window.
+    fn editor_w(&self) -> f32 {
+        let longest = self.doc.content.lines().map(|l| l.text.chars().count()).max().unwrap_or(0);
+        let text = longest as f32 * self.char_px() + TEXT_PAD * 2.0 + self.char_px() * 4.0;
+        text.max(self.viewport_w - self.gutter_w())
+    }
+
     fn line_px(&self) -> f32 {
         self.size_px() * self.config.line_height
     }
@@ -223,6 +266,16 @@ impl Rite {
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             iced::event::listen_with(|event, _, _| match event {
                 iced::Event::Window(window::Event::FileDropped(path)) => Some(Message::Remote(vec![path], None)),
+                iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => Some(Message::Shift(m.shift())),
+                iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { modifiers, .. }) => {
+                    Some(Message::Shift(modifiers.shift()))
+                }
+                iced::Event::Window(window::Event::Unfocused) => Some(Message::Shift(false)),
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => match key {
+                    Key::Named(Named::Escape) => Some(Message::CloseSearch),
+                    Key::Character(c) if modifiers.command() && c.as_str() == "f" => Some(Message::OpenSearch),
+                    _ => None,
+                },
                 _ => None,
             }),
             Subscription::run(|| instance::incoming().map(|(files, token)| Message::Remote(files, token))),
@@ -234,6 +287,9 @@ impl Rite {
             Message::Edit(action) => {
                 if matches!(action, Action::Scroll { .. }) {
                     self.doc.content.perform(action);
+                    return Task::none();
+                }
+                if matches!(action, Action::Edit(_)) && self.search.is_some() {
                     return Task::none();
                 }
                 if let Action::Edit(edit) = &action {
@@ -289,19 +345,66 @@ impl Rite {
                 self.select_next();
                 return self.reveal_cursor();
             }
-            Message::Scrolled(y) => self.doc.offset_y = y,
+            Message::OpenSearch => {
+                // Start from the selected text, if it is a single line.
+                if let Some(sel) = self.doc.content.selection().filter(|s| !s.is_empty() && !s.contains('\n')) {
+                    self.search = Some(sel);
+                } else {
+                    self.search.get_or_insert_with(String::new);
+                }
+                return iced::widget::operation::focus(self.search_id.clone())
+                    .chain(iced::widget::operation::select_all(self.search_id.clone()));
+            }
+            Message::CloseSearch => {
+                if self.search.take().is_some() {
+                    return iced::widget::operation::focus(self.editor_id.clone());
+                }
+            }
+            Message::SearchChanged(query) => self.search = Some(query),
+            Message::SearchNext => return self.search_next(!self.shift),
+            Message::Shift(shift) => self.shift = shift,
+            Message::Scrolled(y) => {
+                if self.last_wheel.elapsed() > WHEEL_ECHO {
+                    self.doc.offset_y = y;
+                }
+            }
+            Message::ScrolledX(x) => {
+                if self.last_wheel.elapsed() > WHEEL_ECHO {
+                    self.doc.offset_x = x;
+                }
+            }
             Message::Wheel(delta) => {
-                let dy = match delta {
-                    iced::mouse::ScrollDelta::Lines { y, .. } => -y * 60.0 * SCROLL_SPEED,
-                    iced::mouse::ScrollDelta::Pixels { y, .. } => -y * SCROLL_SPEED,
+                let (dx, dy) = match delta {
+                    iced::mouse::ScrollDelta::Lines { x, y } => {
+                        let (x, y) = if self.shift { (y, x) } else { (x, y) };
+                        (-x * 60.0 * SCROLL_SPEED, -y * 60.0 * SCROLL_SPEED)
+                    }
+                    iced::mouse::ScrollDelta::Pixels { x, y } => {
+                        let (x, y) = if self.shift { (y, x) } else { (x, y) };
+                        (-x * SCROLL_SPEED, -y * SCROLL_SPEED)
+                    }
                 };
-                let max = (self.doc.content.line_count() as f32 - 1.0) * self.line_px();
-                let target = (self.doc.offset_y + dy).clamp(0.0, max.max(0.0));
-                self.doc.offset_y = target;
-                return iced::widget::operation::scroll_to(
-                    self.scroll_id.clone(),
-                    scrollable::AbsoluteOffset { x: None, y: Some(target) },
-                );
+                self.last_wheel = std::time::Instant::now();
+                let mut tasks = Vec::new();
+                if dy != 0.0 {
+                    let max = (self.doc.content.line_count() as f32 - 1.0) * self.line_px();
+                    let target = (self.doc.offset_y + dy).clamp(0.0, max.max(0.0));
+                    self.doc.offset_y = target;
+                    tasks.push(iced::widget::operation::scroll_to(
+                        self.scroll_id.clone(),
+                        scrollable::AbsoluteOffset { x: None, y: Some(target) },
+                    ));
+                }
+                if dx != 0.0 {
+                    let max = self.editor_w() - (self.viewport_w - self.gutter_w());
+                    let target = (self.doc.offset_x + dx).clamp(0.0, max.max(0.0));
+                    self.doc.offset_x = target;
+                    tasks.push(iced::widget::operation::scroll_to(
+                        self.hscroll_id.clone(),
+                        scrollable::AbsoluteOffset { x: Some(target), y: None },
+                    ));
+                }
+                return Task::batch(tasks);
             }
             Message::Remote(paths, token) => {
                 let mut tasks: Vec<Task<Message>> = paths.into_iter().map(|p| self.open_path(p)).collect();
@@ -324,7 +427,10 @@ impl Rite {
                 }));
                 return Task::batch(tasks);
             }
-            Message::Resized(size) => self.viewport_h = size.height,
+            Message::Resized(size) => {
+                self.viewport_h = size.height;
+                self.viewport_w = size.width;
+            }
             Message::Save => return self.save(),
             Message::SaveDialog(path) => {
                 if let Some(path) = path {
@@ -494,6 +600,51 @@ impl Rite {
         });
     }
 
+    /// Enter / Shift+Enter in the find bar: select the next or previous match
+    /// relative to the cursor, wrapping around.
+    fn search_next(&mut self, forward: bool) -> Task<Message> {
+        let needle = fold(self.search.as_deref().unwrap_or(""));
+        if needle.is_empty() {
+            return Task::none();
+        }
+        let cur = self.doc.content.cursor();
+        let key = |p: Position| (p.line, p.column);
+        let anchor = cur.selection.unwrap_or(cur.position);
+        let (lo, hi) = (key(anchor).min(key(cur.position)), key(anchor).max(key(cur.position)));
+        let all: Vec<(usize, Found)> = self
+            .doc
+            .content
+            .lines()
+            .enumerate()
+            .flat_map(|(i, l)| find_all(&l.text, &needle).into_iter().map(move |m| (i, m)))
+            .collect();
+        let target = if forward {
+            all.iter().find(|(l, m)| (*l, m.start) >= hi).or(all.first())
+        } else {
+            all.iter().rev().find(|(l, m)| (*l, m.start) < lo).or(all.last())
+        };
+        let Some(&(line, m)) = target else { return Task::none() };
+        self.doc.extras.clear();
+        self.doc.last_edit = EditKind::None;
+        self.doc.content.move_to(Cursor {
+            position: Position { line, column: m.end },
+            selection: Some(Position { line, column: m.start }),
+        });
+
+        // Put the match line in the middle of the viewport.
+        let lh = self.line_px();
+        let max = (self.doc.content.line_count() as f32 - 1.0) * lh;
+        let target = (line as f32 * lh + lh / 2.0 - self.viewport_h / 2.0).clamp(0.0, max.max(0.0));
+        self.doc.offset_y = target;
+        Task::batch([
+            iced::widget::operation::scroll_to(
+                self.scroll_id.clone(),
+                scrollable::AbsoluteOffset { x: None, y: Some(target) },
+            ),
+            self.reveal_cursor_x(),
+        ])
+    }
+
     /// Tab / Shift+Tab over the selected lines (or the current line).
     fn shift_indent(&mut self, indent: bool) {
         if !self.doc.extras.is_empty() {
@@ -637,9 +788,13 @@ impl Rite {
         self.mark_dirty();
     }
 
-    /// The editor is laid out at its full height inside a scrollable, so keep
-    /// the cursor line in view ourselves.
+    /// The editor is laid out at its full size inside scrollables, so keep
+    /// the cursor in view ourselves.
     fn reveal_cursor(&mut self) -> Task<Message> {
+        Task::batch([self.reveal_cursor_y(), self.reveal_cursor_x()])
+    }
+
+    fn reveal_cursor_y(&mut self) -> Task<Message> {
         let lh = self.line_px();
         let top = self.doc.content.cursor().position.line as f32 * lh;
         let bottom = top + lh;
@@ -654,6 +809,31 @@ impl Rite {
         iced::widget::operation::scroll_to(
             self.scroll_id.clone(),
             scrollable::AbsoluteOffset { x: None, y: Some(target) },
+        )
+    }
+
+    fn reveal_cursor_x(&mut self) -> Task<Message> {
+        let pos = self.doc.content.cursor().position;
+        let col = self
+            .doc
+            .content
+            .line(pos.line)
+            .map_or(0, |l| l.text[..pos.column.min(l.text.len())].chars().count());
+        let cw = self.char_px();
+        let margin = cw * 2.0;
+        let x = TEXT_PAD + col as f32 * cw;
+        let view = (self.viewport_w - self.gutter_w()).max(0.0);
+        let target = if x - margin < self.doc.offset_x {
+            (x - margin).max(0.0)
+        } else if x + cw + margin > self.doc.offset_x + view {
+            x + cw + margin - view
+        } else {
+            return Task::none();
+        };
+        self.doc.offset_x = target;
+        iced::widget::operation::scroll_to(
+            self.hscroll_id.clone(),
+            scrollable::AbsoluteOffset { x: Some(target), y: None },
         )
     }
 
@@ -688,10 +868,16 @@ impl Rite {
     }
 
     fn scroll_to_saved(&self) -> Task<Message> {
-        iced::widget::operation::scroll_to(
-            self.scroll_id.clone(),
-            scrollable::AbsoluteOffset { x: None, y: Some(self.doc.offset_y) },
-        )
+        Task::batch([
+            iced::widget::operation::scroll_to(
+                self.scroll_id.clone(),
+                scrollable::AbsoluteOffset { x: None, y: Some(self.doc.offset_y) },
+            ),
+            iced::widget::operation::scroll_to(
+                self.hscroll_id.clone(),
+                scrollable::AbsoluteOffset { x: Some(self.doc.offset_x), y: None },
+            ),
+        ])
     }
 
     fn switch_to(&mut self, index: usize) -> Task<Message> {
@@ -853,8 +1039,7 @@ impl Rite {
         let past_end = (self.viewport_h - lh * 2.0).max(0.0);
 
         let count = self.doc.content.line_count().max(1);
-        let digits = count.to_string().len().max(2) as f32;
-        let gutter_w = digits * size * 0.62 + GUTTER_PAD * 2.0;
+        let gutter_w = self.gutter_w();
         let numbers = (1..=count).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
 
         let gutter = iced::widget::column![
@@ -880,15 +1065,20 @@ impl Rite {
         };
         let selecting = self.doc.content.selection().is_some();
         let close_index = self.active;
+        let searching = self.search.is_some();
         let editor = text_editor_widget(&self.doc.content)
             .font(self.font)
             .size(size)
             .line_height(LineHeight::Absolute(Pixels(lh)))
             .padding(Padding { top: 0.0, right: TEXT_PAD, bottom: past_end, left: TEXT_PAD })
             .height(Length::Shrink)
+            .id(self.editor_id.clone())
+            // Overlays and the gutter assume one visual row per line.
+            .wrapping(text::Wrapping::None)
+            .width(self.editor_w())
             .on_action(Message::Edit)
             .key_binding(move |press| {
-                match (&press.key, press.modifiers.command()) {
+                let binding = match (&press.key, press.modifiers.command()) {
                     (Key::Character(c), true) if c.as_str() == "s" => Some(Binding::Custom(Message::Save)),
                     (Key::Character(c), true) if c.as_str() == "z" && !press.modifiers.shift() => {
                         Some(Binding::Custom(Message::Undo))
@@ -897,6 +1087,7 @@ impl Rite {
                         Some(Binding::Custom(Message::Redo))
                     }
                     (Key::Named(Named::Backspace), true) => Some(Binding::Custom(Message::DeleteWord)),
+                    (Key::Character(c), true) if c.as_str() == "f" => Some(Binding::Custom(Message::OpenSearch)),
                     (Key::Character(c), true) if c.as_str() == "d" => Some(Binding::Custom(Message::SelectNext)),
                     (Key::Named(Named::ArrowUp), _) if press.modifiers.alt() => {
                         Some(Binding::Custom(Message::MoveLine(true)))
@@ -925,6 +1116,34 @@ impl Rite {
                     (Key::Named(Named::PageDown), false) => Some(Binding::Move(Motion::PageDown)),
                     (Key::Named(Named::PageUp), false) => Some(Binding::Move(Motion::PageUp)),
                     _ => Binding::from_key_press(press),
+                };
+                if !searching {
+                    return binding;
+                }
+                // The find bar is open: navigation and tab commands only, no editing.
+                match binding {
+                    Some(Binding::Custom(Message::Enter)) => Some(Binding::Custom(Message::SearchNext)),
+                    Some(
+                        b @ (Binding::Move(_)
+                        | Binding::Select(_)
+                        | Binding::SelectWord
+                        | Binding::SelectLine
+                        | Binding::SelectAll
+                        | Binding::Copy
+                        | Binding::Unfocus),
+                    ) => Some(b),
+                    Some(
+                        b @ Binding::Custom(
+                            Message::Save
+                            | Message::Open
+                            | Message::NewTab
+                            | Message::CloseTab(_)
+                            | Message::SwitchTab(_)
+                            | Message::CycleTab(_)
+                            | Message::OpenSearch,
+                        ),
+                    ) => Some(b),
+                    _ => None,
                 }
             })
             .highlight_with::<highlight::Syntax>(hl_settings, highlight::format)
@@ -963,6 +1182,21 @@ impl Rite {
             }
         }
 
+        // Every match of the search query.
+        let needle = self.search.as_deref().map(fold).filter(|n| !n.is_empty());
+        let mut found = Vec::new();
+        let mut found_total = 0;
+        if let Some(needle) = &needle {
+            for (line, t) in texts.iter().enumerate() {
+                for m in find_all(t, needle) {
+                    found_total += 1;
+                    if visible.contains(&line) {
+                        found.push((line, m.col, needle.len()));
+                    }
+                }
+            }
+        }
+
         // Extra cursors: (line, start column, end column, head line, head column).
         let extras = self
             .doc.extras
@@ -978,19 +1212,29 @@ impl Rite {
             first,
             indents: fill_indents(&texts)[visible].to_vec(),
             matches,
+            found,
             extras,
-            origin_x: gutter_w + TEXT_PAD,
+            origin_x: TEXT_PAD,
             char_w: size * CHAR_WIDTH,
             line_h: lh,
             color: Color { a: 0.14, ..p.foreground },
             ruler: Color { a: 0.22, ..p.foreground },
             highlight: Color { a: 0.2, ..p.foreground },
+            found_color: Color::from_rgba8(0xf5, 0xc5, 0x42, 0.4),
             cursor: p.foreground,
         };
         let overlay = canvas(guides).width(Length::Fill).height(Length::Fill);
 
+        // Only the text scrolls sideways; the gutter stays put.
+        let hscroll = scrollable(iced::widget::mouse_area(stack![editor, overlay]).on_scroll(Message::Wheel))
+            .id(self.hscroll_id.clone())
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .on_scroll(|v| Message::ScrolledX(v.absolute_offset().x))
+            .width(Length::Fill);
         let body = scrollable(
-            iced::widget::mouse_area(stack![row![gutter, editor], overlay]).on_scroll(Message::Wheel),
+            iced::widget::mouse_area(row![gutter, hscroll]).on_scroll(Message::Wheel),
         )
             .id(self.scroll_id.clone())
             .on_scroll(|v| Message::Scrolled(v.absolute_offset().y))
@@ -998,6 +1242,34 @@ impl Rite {
             .height(Length::Fill);
 
         let mut page = iced::widget::column![self.tab_bar(), body];
+        if let Some(query) = &self.search {
+            let count = if query.is_empty() {
+                String::new()
+            } else {
+                format!("{found_total} found")
+            };
+            page = page.push(
+                container(
+                    row![
+                        text_input("Find", query)
+                            .id(self.search_id.clone())
+                            .on_input(Message::SearchChanged)
+                            .on_submit(Message::SearchNext)
+                            .size(13)
+                            .padding(4),
+                        text(count).size(12).color(p.gutter).width(80),
+                    ]
+                    .spacing(8)
+                    .align_y(alignment::Vertical::Center),
+                )
+                .padding([4, 8])
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.3))),
+                    ..Default::default()
+                }),
+            );
+        }
         if let Some(status) = &self.status {
             page = page.push(
                 container(text(status.clone()).size(12).color(p.gutter))
@@ -1016,6 +1288,39 @@ impl Rite {
             })
             .into()
     }
+}
+
+/// Case-insensitive comparison form of `s`, one folded char per input char.
+fn fold(s: &str) -> Vec<char> {
+    s.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect()
+}
+
+#[derive(Clone, Copy)]
+struct Found {
+    /// Start column in characters.
+    col: usize,
+    /// Byte range within the line.
+    start: usize,
+    end: usize,
+}
+
+/// Non-overlapping case-insensitive occurrences of `needle` in `line`.
+fn find_all(line: &str, needle: &[char]) -> Vec<Found> {
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let folded: Vec<char> = chars.iter().map(|&(_, c)| c.to_lowercase().next().unwrap_or(c)).collect();
+    let n = needle.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while n > 0 && i + n <= folded.len() {
+        if folded[i..i + n] == *needle {
+            let end = chars.get(i + n).map_or(line.len(), |c| c.0);
+            out.push(Found { col: i, start: chars[i].0, end });
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 fn indent_columns(line: &str) -> Option<usize> {
@@ -1188,6 +1493,8 @@ struct Guides {
     indents: Vec<usize>,
     /// (line, start column, length) in characters.
     matches: Vec<(usize, usize, usize)>,
+    /// Search matches, as (line, start column, length) in characters.
+    found: Vec<(usize, usize, usize)>,
     /// (line, start column, end column, head line, head column) in characters.
     extras: Vec<(usize, usize, usize, usize, usize)>,
     origin_x: f32,
@@ -1196,6 +1503,7 @@ struct Guides {
     color: Color,
     ruler: Color,
     highlight: Color,
+    found_color: Color,
     cursor: Color,
 }
 
@@ -1245,6 +1553,14 @@ impl<M> canvas::Program<M> for Guides {
                 iced::Point::new(col_x(col), line_y(line)),
                 Size::new(len as f32 * self.char_w, self.line_h),
                 self.highlight,
+            );
+        }
+
+        for &(line, col, len) in &self.found {
+            frame.fill_rectangle(
+                iced::Point::new(col_x(col), line_y(line)),
+                Size::new(len as f32 * self.char_w, self.line_h),
+                self.found_color,
             );
         }
 
