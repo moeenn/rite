@@ -1,8 +1,11 @@
+mod activation;
 mod config;
 mod highlight;
+mod instance;
 mod theme;
 
 use config::Config;
+use iced::futures::StreamExt;
 use iced::keyboard::{Key, key::Named};
 use iced::widget::{
     Id, Space, canvas, container, row, stack, scrollable, text, text_editor as text_editor_widget,
@@ -19,12 +22,20 @@ const POINT_TO_PIXEL: f32 = 4.0 / 3.0;
 const GUTTER_PAD: f32 = 20.0;
 const TEXT_PAD: f32 = 12.0;
 const TAB_WIDTH: usize = 4;
+/// Wheel scrolling relative to the scrollable's built-in speed.
+const SCROLL_SPEED: f32 = 1.4;
 const CLOSE_SIZE: f32 = 24.0;
 const RULER_COLUMN: f32 = 80.0;
 /// Advance width of a monospace glyph, relative to the font size.
 const CHAR_WIDTH: f32 = 0.6;
 
 fn main() -> iced::Result {
+    let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if instance::forward(&files) {
+        return Ok(());
+    }
+    instance::listen();
+
     let config = config::load();
     iced::application(Rite::new, Rite::update, Rite::view)
         .title(Rite::title)
@@ -124,6 +135,9 @@ const UNDO_LIMIT: usize = 200;
 enum Message {
     Edit(Action),
     Scrolled(f32),
+    Wheel(iced::mouse::ScrollDelta),
+    /// Files to open, from a drop or another `rite` invocation.
+    Remote(Vec<PathBuf>, Option<String>),
     Resized(Size),
     Save,
     SaveDialog(Option<PathBuf>),
@@ -205,7 +219,14 @@ impl Rite {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        window::resize_events().map(|(_, size)| Message::Resized(size))
+        Subscription::batch([
+            window::resize_events().map(|(_, size)| Message::Resized(size)),
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Window(window::Event::FileDropped(path)) => Some(Message::Remote(vec![path], None)),
+                _ => None,
+            }),
+            Subscription::run(|| instance::incoming().map(|(files, token)| Message::Remote(files, token))),
+        ])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -269,6 +290,40 @@ impl Rite {
                 return self.reveal_cursor();
             }
             Message::Scrolled(y) => self.doc.offset_y = y,
+            Message::Wheel(delta) => {
+                let dy = match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. } => -y * 60.0 * SCROLL_SPEED,
+                    iced::mouse::ScrollDelta::Pixels { y, .. } => -y * SCROLL_SPEED,
+                };
+                let max = (self.doc.content.line_count() as f32 - 1.0) * self.line_px();
+                let target = (self.doc.offset_y + dy).clamp(0.0, max.max(0.0));
+                self.doc.offset_y = target;
+                return iced::widget::operation::scroll_to(
+                    self.scroll_id.clone(),
+                    scrollable::AbsoluteOffset { x: None, y: Some(target) },
+                );
+            }
+            Message::Remote(paths, token) => {
+                let mut tasks: Vec<Task<Message>> = paths.into_iter().map(|p| self.open_path(p)).collect();
+                if let Some(token) = token {
+                    tasks.push(window::latest().and_then(move |id| {
+                        let token = token.clone();
+                        window::run(id, move |w| activation::activate(w, &token)).discard()
+                    }));
+                }
+                // Un-minimize, and bounce through always-on-top since a plain
+                // focus request is ignored by many window managers. Wayland
+                // ignores focus requests altogether; there the only way in is
+                // an xdg-activation request, which winit sends for attention.
+                tasks.push(window::latest().and_then(|id| {
+                    window::minimize(id, false)
+                        .chain(window::set_level(id, window::Level::AlwaysOnTop))
+                        .chain(window::set_level(id, window::Level::Normal))
+                        .chain(window::gain_focus(id))
+                        .chain(window::request_user_attention(id, Some(window::UserAttention::Critical)))
+                }));
+                return Task::batch(tasks);
+            }
             Message::Resized(size) => self.viewport_h = size.height,
             Message::Save => return self.save(),
             Message::SaveDialog(path) => {
@@ -934,7 +989,9 @@ impl Rite {
         };
         let overlay = canvas(guides).width(Length::Fill).height(Length::Fill);
 
-        let body = scrollable(stack![row![gutter, editor], overlay])
+        let body = scrollable(
+            iced::widget::mouse_area(stack![row![gutter, editor], overlay]).on_scroll(Message::Wheel),
+        )
             .id(self.scroll_id.clone())
             .on_scroll(|v| Message::Scrolled(v.absolute_offset().y))
             .width(Length::Fill)

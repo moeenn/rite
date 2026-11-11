@@ -2623,9 +2623,12 @@ name = "rite"
 version = "0.1.0"
 dependencies = [
  "iced",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
