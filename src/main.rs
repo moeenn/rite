@@ -60,8 +60,6 @@ struct Doc {
     path: Option<PathBuf>,
     dirty: bool,
     offset_y: f32,
-    /// Additional cursors as (anchor, head) byte offsets into the document.
-    extras: Vec<(usize, usize)>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last_edit: EditKind,
@@ -76,7 +74,6 @@ impl Doc {
             path: None,
             dirty: false,
             offset_y: 0.0,
-            extras: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: EditKind::None,
@@ -189,7 +186,6 @@ enum Message {
     Enter,
     Indent(bool),
     MoveLine(bool),
-    SelectNext,
     DeleteWord,
     Undo,
     Redo,
@@ -358,33 +354,25 @@ impl Rite {
                     });
                     self.mark_dirty();
                     match edit {
-                        Edit::Insert(c) => {
-                            let c = *c;
-                            self.apply(|content| insert_char(content, c));
-                        }
-                        _ => self.apply(|c| c.perform(action.clone())),
+                        Edit::Insert(c) => insert_char(&mut self.doc.content, *c),
+                        _ => self.doc.content.perform(action),
                     }
                 } else {
                     self.doc.last_edit = EditKind::None;
-                    self.doc.extras.clear();
-                    let whole = matches!(action, Action::SelectWord | Action::SelectLine);
                     self.doc.content.perform(action);
-                    if whole {
-                        normalize_selection(&mut self.doc.content);
-                    }
                 }
                 return self.reveal_cursor();
             }
             Message::Enter => {
                 self.record(EditKind::Other);
                 self.mark_dirty();
-                self.apply(enter_with_indent);
+                enter_with_indent(&mut self.doc.content);
                 return self.reveal_cursor();
             }
             Message::DeleteWord => {
                 self.record(EditKind::Other);
                 self.mark_dirty();
-                self.apply(delete_word);
+                delete_word(&mut self.doc.content);
                 return self.reveal_cursor();
             }
             Message::Undo => {
@@ -401,10 +389,6 @@ impl Rite {
             }
             Message::MoveLine(up) => {
                 self.move_lines(up);
-                return self.reveal_cursor();
-            }
-            Message::SelectNext => {
-                self.select_next();
                 return self.reveal_cursor();
             }
             Message::OpenSearch => {
@@ -424,7 +408,6 @@ impl Rite {
                 if self.search.take().is_some() {
                     return iced::widget::operation::focus(self.editor_id.clone());
                 }
-                self.doc.extras.clear();
             }
             Message::SearchChanged(query) => self.search = Some(query),
             Message::SearchNext => return self.search_next(!self.shift),
@@ -561,7 +544,6 @@ impl Rite {
         let position = pos_of(&self.doc.content, target.head);
         let selection = (target.anchor != target.head).then(|| pos_of(&self.doc.content, target.anchor));
         self.doc.content.move_to(Cursor { position, selection });
-        self.doc.extras.clear();
         self.doc.last_edit = EditKind::None;
         self.doc.dirty = true;
     }
@@ -569,83 +551,6 @@ impl Rite {
     fn mark_dirty(&mut self) {
         self.doc.dirty = true;
         self.status = None;
-    }
-
-    /// Runs an edit once per cursor. With several cursors the edits run from the
-    /// end of the document backwards so earlier offsets stay valid, and the
-    /// cursors are then moved by the net size change of the edits after them.
-    fn apply(&mut self, mut edit: impl FnMut(&mut Content)) {
-        if self.doc.extras.is_empty() {
-            edit(&mut self.doc.content);
-            return;
-        }
-
-        let cur = self.doc.content.cursor();
-        let head = offset_of(&self.doc.content, cur.position);
-        let anchor = cur.selection.map_or(head, |a| offset_of(&self.doc.content, a));
-
-        let mut sels: Vec<(usize, usize, bool)> = self.doc.extras.iter().map(|&(a, h)| (a, h, false)).collect();
-        sels.push((anchor, head, true));
-        sels.sort_by_key(|&(a, h, _)| std::cmp::Reverse(a.min(h)));
-        sels.dedup_by_key(|&mut (a, h, _)| (a, h));
-
-        let mut done: Vec<(usize, isize, bool)> = Vec::new();
-        for (a, h, primary) in sels {
-            let before = total_len(&self.doc.content) as isize;
-            place(&mut self.doc.content, a, h);
-            edit(&mut self.doc.content);
-            let after = total_len(&self.doc.content) as isize;
-            let at = offset_of(&self.doc.content, self.doc.content.cursor().position);
-            done.push((at, after - before, primary));
-        }
-
-        self.doc.extras.clear();
-        let mut shift = 0isize;
-        let mut finals: Vec<(usize, bool)> = Vec::new();
-        // `done` is in descending document order; walk it from the document start.
-        for &(at, delta, primary) in done.iter().rev() {
-            finals.push(((at as isize + shift) as usize, primary));
-            shift += delta;
-        }
-        for (at, primary) in finals {
-            if primary {
-                place(&mut self.doc.content, at, at);
-            } else {
-                self.doc.extras.push((at, at));
-            }
-        }
-    }
-
-    /// Ctrl+D: keep the current selection as an extra cursor and select the
-    /// next identical piece of text.
-    fn select_next(&mut self) {
-        let Some(needle) = self.doc.content.selection().filter(|s| !s.is_empty()) else {
-            return;
-        };
-        let cur = self.doc.content.cursor();
-        let head = offset_of(&self.doc.content, cur.position);
-        let anchor = cur.selection.map_or(head, |a| offset_of(&self.doc.content, a));
-        let (start, end) = (anchor.min(head), anchor.max(head));
-
-        let mut taken: Vec<(usize, usize)> = self.doc.extras.iter().map(|&(a, h)| (a.min(h), a.max(h))).collect();
-        taken.push((start, end));
-        let from = taken.iter().map(|t| t.1).max().unwrap_or(end);
-
-        let text = self.doc.content.text();
-        let found = text[from..]
-            .find(&needle)
-            .map(|i| i + from)
-            .or_else(|| text[..from].find(&needle));
-        let Some(next) = found else { return };
-        if taken.iter().any(|t| t.0 == next) {
-            return;
-        }
-
-        self.doc.extras.push((start, end));
-        self.doc.content.move_to(Cursor {
-            position: pos_of(&self.doc.content, next + needle.len()),
-            selection: Some(pos_of(&self.doc.content, next)),
-        });
     }
 
     /// Enter / Shift+Enter in the find bar: select the next or previous match
@@ -672,7 +577,6 @@ impl Rite {
             all.iter().rev().find(|(l, m)| (*l, m.start) < lo).or(all.last())
         };
         let Some(&(line, m)) = target else { return Task::none() };
-        self.doc.extras.clear();
         self.doc.last_edit = EditKind::None;
         self.doc.content.move_to(Cursor {
             position: Position { line, column: m.end },
@@ -694,9 +598,6 @@ impl Rite {
 
     /// Tab / Shift+Tab over the selected lines (or the current line).
     fn shift_indent(&mut self, indent: bool) {
-        if !self.doc.extras.is_empty() {
-            return;
-        }
         self.record(EditKind::Other);
         let cur = self.doc.content.cursor();
         let anchor = cur.selection.unwrap_or(cur.position);
@@ -749,9 +650,6 @@ impl Rite {
     /// Alt+Up / Alt+Down: moves the selected lines (or the current line) past
     /// their neighbour and re-indents them to fit their new surroundings.
     fn move_lines(&mut self, up: bool) {
-        if !self.doc.extras.is_empty() {
-            return;
-        }
         let cur = self.doc.content.cursor();
         let anchor = cur.selection.unwrap_or(cur.position);
         let key = |p: &Position| (p.line, p.column);
@@ -1162,7 +1060,8 @@ impl Rite {
                     }
                     (Key::Named(Named::Backspace), true) => Some(Binding::Custom(Message::DeleteWord)),
                     (Key::Character(c), true) if c.as_str() == "f" => Some(Binding::Custom(Message::OpenSearch)),
-                    (Key::Character(c), true) if c.as_str() == "d" => Some(Binding::Custom(Message::SelectNext)),
+                    // Ctrl+D does nothing.
+                    (Key::Character(c), true) if c.as_str() == "d" => None,
                     (Key::Named(Named::ArrowUp), _) if press.modifiers.alt() => {
                         Some(Binding::Custom(Message::MoveLine(true)))
                     }
@@ -1242,7 +1141,6 @@ impl Rite {
         let texts: Vec<String> = self.doc.content.lines().map(|l| l.text.to_string()).collect();
         let cur = self.doc.content.cursor();
         let needle = self.doc.content.selection().filter(|s| !s.is_empty() && !s.contains('\n'));
-        let char_col = |p: Position| texts.get(p.line).map_or(0, |t| t[..p.column.min(t.len())].chars().count());
 
         // Other occurrences of the selected text.
         let mut matches = Vec::new();
@@ -1277,24 +1175,12 @@ impl Rite {
             }
         }
 
-        // Extra cursors: (line, start column, end column, head line, head column).
-        let extras = self
-            .doc.extras
-            .iter()
-            .map(|&(a, h)| {
-                let (pa, ph) = (pos_of(&self.doc.content, a), pos_of(&self.doc.content, h));
-                let (sa, sh) = (char_col(pa), char_col(ph));
-                (pa.line, sa, if pa.line == ph.line { sh } else { sa }, ph.line, sh)
-            })
-            .collect();
-
         let guides = Guides {
             first,
             layout: layout.clone(),
             indents: fill_indents(&texts)[visible].to_vec(),
             matches,
             found,
-            extras,
             origin_x: TEXT_PAD,
             char_w: size * CHAR_WIDTH,
             line_h: lh,
@@ -1302,7 +1188,6 @@ impl Rite {
             ruler: Color { a: 0.22, ..p.foreground },
             highlight: Color { a: 0.2, ..p.foreground },
             found_color: Color::from_rgba8(0xf5, 0xc5, 0x42, 0.4),
-            cursor: p.foreground,
         };
         let overlay = canvas(guides).width(Length::Fill).height(Length::Fill);
 
@@ -1547,48 +1432,6 @@ fn pos_of(content: &Content, offset: usize) -> Position {
     last
 }
 
-/// Puts the cursor at `head`, selecting back to `anchor` when they differ.
-/// A bare `move_to` without a selection keeps whatever was selected before.
-fn place(content: &mut Content, anchor: usize, head: usize) {
-    let position = pos_of(content, head);
-    if anchor != head {
-        let selection = Some(pos_of(content, anchor));
-        content.move_to(Cursor { position, selection });
-        return;
-    }
-    // Moving with an (empty) selection drops it and leaves the cursor in place.
-    content.move_to(Cursor { position, selection: Some(position) });
-    content.perform(Action::Move(Motion::Left));
-}
-
-/// Word and line selections (double and triple click) report the click point
-/// as both of their ends; turn them into a plain selection of what they cover.
-fn normalize_selection(content: &mut Content) {
-    let cur = content.cursor();
-    let (Some(anchor), Some(text)) = (cur.selection, content.selection()) else {
-        return;
-    };
-    let backwards = (cur.position.line, cur.position.column) < (anchor.line, anchor.column);
-    // With a selection, moving left lands on its start.
-    content.perform(Action::Move(Motion::Left));
-    if text.is_empty() {
-        return;
-    }
-    let start = content.cursor().position;
-    let rows = text.matches('\n').count();
-    let tail = text.rsplit('\n').next().unwrap_or("").len();
-    let end = Position {
-        line: start.line + rows,
-        column: if rows == 0 { start.column + tail } else { tail },
-    };
-    let (position, selection) = if backwards { (start, end) } else { (end, start) };
-    content.move_to(Cursor { position, selection: Some(selection) });
-}
-
-fn total_len(content: &Content) -> usize {
-    content.lines().map(|l| l.text.len() + l.ending.as_str().len()).sum()
-}
-
 fn closer(open: char) -> Option<char> {
     Some(match open {
         '(' => ')',
@@ -1693,7 +1536,7 @@ fn enter_with_indent(content: &mut Content) {
 }
 
 /// Dim indentation guides, the long-line ruler, occurrences of the selected
-/// text and extra cursors, drawn over the editor.
+/// text and search matches, drawn over the editor.
 struct Guides {
     first: usize,
     layout: Layout,
@@ -1702,8 +1545,6 @@ struct Guides {
     matches: Vec<(usize, usize, usize)>,
     /// Search matches, as (line, start column, length) in characters.
     found: Vec<(usize, usize, usize)>,
-    /// (line, start column, end column, head line, head column) in characters.
-    extras: Vec<(usize, usize, usize, usize, usize)>,
     origin_x: f32,
     char_w: f32,
     line_h: f32,
@@ -1711,7 +1552,6 @@ struct Guides {
     ruler: Color,
     highlight: Color,
     found_color: Color,
-    cursor: Color,
 }
 
 impl<M> canvas::Program<M> for Guides {
@@ -1790,24 +1630,6 @@ impl<M> canvas::Program<M> for Guides {
                     self.found_color,
                 );
             }
-        }
-
-        for &(line, from, to, head_line, head_col) in &self.extras {
-            if to > from {
-                for (x, row, n) in spans(line, from, to - from) {
-                    frame.fill_rectangle(
-                        iced::Point::new(col_x(x), row_y(row)),
-                        Size::new(n as f32 * self.char_w, self.line_h),
-                        Color { a: 0.3, ..self.cursor },
-                    );
-                }
-            }
-            let (hrow, hx) = self.layout.at(head_line, head_col);
-            frame.fill_rectangle(
-                iced::Point::new(col_x(hx), row_y(hrow)),
-                Size::new(2.0, self.line_h),
-                self.cursor,
-            );
         }
         vec![frame.into_geometry()]
     }
