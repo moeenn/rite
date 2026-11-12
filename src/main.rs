@@ -29,9 +29,9 @@ const WHEEL_ECHO: std::time::Duration = std::time::Duration::from_millis(150);
 /// PageUp / PageDown scroll by this share of the visible document height.
 const PAGE_SCROLL: f32 = 0.75;
 const CLOSE_SIZE: f32 = 24.0;
-/// How long "saved" stays up after a save.
-const SAVED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
 const DIM_GREY: Color = Color::from_rgb8(0x55, 0x55, 0x55);
+/// Tab label colour of a document saved since its last edit.
+const SAVED_GREEN: Color = Color::from_rgb8(0x5f, 0xd0, 0x6a);
 const RULER_COLUMN: f32 = 80.0;
 /// Advance width of a monospace glyph, relative to the font size.
 const CHAR_WIDTH: f32 = 0.6;
@@ -62,6 +62,8 @@ struct Doc {
     content: Content,
     path: Option<PathBuf>,
     dirty: bool,
+    /// Saved, with no edits since; its tab label is shown in green.
+    saved: bool,
     offset_y: f32,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -76,6 +78,7 @@ impl Doc {
             content: Content::new(),
             path: None,
             dirty: false,
+            saved: false,
             offset_y: 0.0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -113,8 +116,6 @@ struct Rite {
     tabs: Vec<Doc>,
     active: usize,
     status: Option<String>,
-    /// When "saved" was last shown; it hides itself `SAVED_FOR` later.
-    saved_at: Option<std::time::Instant>,
     config: Config,
     font: Font,
     palette: Palette,
@@ -173,8 +174,6 @@ enum Message {
     Resized(Size),
     Save,
     SaveDialog(Option<PathBuf>),
-    /// Hides "saved" once it has been shown for `SAVED_FOR`.
-    HideSaved,
     Open,
     Opened(Option<PathBuf>),
     NewTab,
@@ -234,7 +233,6 @@ impl Rite {
             tabs,
             active: 0,
             status,
-            saved_at: None,
             config,
             palette,
             scroll_id: Id::new("rite-scroll"),
@@ -401,7 +399,6 @@ impl Rite {
                 return self.reveal_cursor();
             }
             Message::OpenSearch => {
-                self.saved_at = None;
                 // Start from the selected text, if it is a single line.
                 if let Some(sel) = self.doc.content.selection().filter(|s| !s.is_empty() && !s.contains('\n')) {
                     self.search = Some(sel);
@@ -505,12 +502,6 @@ impl Rite {
                     return iced::exit();
                 }
                 self.closing = Some(Closing::Window);
-                self.saved_at = None;
-            }
-            Message::HideSaved => {
-                if self.saved_at.is_some_and(|t| t.elapsed() >= SAVED_FOR) {
-                    self.saved_at = None;
-                }
             }
             Message::QuitConfirmed => return iced::exit(),
             Message::CloseConfirmed(id) => {
@@ -567,12 +558,13 @@ impl Rite {
         self.doc.content.move_to(Cursor { position, selection });
         self.doc.last_edit = EditKind::None;
         self.doc.dirty = true;
+        self.doc.saved = false;
     }
 
     fn mark_dirty(&mut self) {
         self.doc.dirty = true;
+        self.doc.saved = false;
         self.status = None;
-        self.saved_at = None;
     }
 
     /// Enter / Shift+Enter in the find bar: select the next or previous match
@@ -812,23 +804,11 @@ impl Rite {
         match std::fs::write(path, text) {
             Ok(()) => {
                 self.doc.dirty = false;
+                self.doc.saved = true;
                 self.status = None;
-                self.saved_at = Some(std::time::Instant::now());
-                return Task::perform(
-                    async {
-                        let (tx, rx) = iced::futures::channel::oneshot::channel();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(SAVED_FOR);
-                            let _ = tx.send(());
-                        });
-                        let _ = rx.await;
-                    },
-                    |_| Message::HideSaved,
-                );
             }
             Err(e) => {
                 eprintln!("rite: cannot write {}: {e}", path.display());
-                self.saved_at = None;
                 self.status = Some(format!("save failed: {e}"));
             }
         }
@@ -870,7 +850,6 @@ impl Rite {
             return self.force_close_tab(index);
         }
         self.closing = Some(Closing::Tab(doc.id));
-        self.saved_at = None;
         Task::none()
     }
 
@@ -969,10 +948,14 @@ impl Rite {
             let doc = if i == self.active { &self.doc } else { &self.tabs[i] };
             let active = i == self.active;
             let label = format!("{}{}", if doc.dirty { "● " } else { "" }, doc.name());
+            let saved = doc.saved;
             let tab = iced::widget::button(text(label).size(13))
                 .padding(0)
                 .on_press(Message::SwitchTab(i))
-                .style(move |_, _| tab_style(p, active));
+                .style(move |_, _| {
+                    let style = tab_style(p, active);
+                    if saved { iced::widget::button::Style { text_color: SAVED_GREEN, ..style } } else { style }
+                });
             let close = iced::widget::button(
                 text("×")
                     .size(20)
@@ -1272,21 +1255,6 @@ impl Rite {
         }
         if let Some(bar) = self.close_bar() {
             page = page.push(bar);
-        }
-        if self.saved_at.is_some() && self.search.is_none() && self.closing.is_none() {
-            page = page.push(
-                container(
-                    container(text("saved").size(12).color(Color::from_rgb8(0x5f, 0xd0, 0x6a)))
-                        .padding([2, 10])
-                        .style(|_| container::Style {
-                            background: Some(iced::Background::Color(DIM_GREY)),
-                            border: iced::Border { radius: 999.0.into(), ..Default::default() },
-                            ..Default::default()
-                        }),
-                )
-                .padding([4, 8])
-                .width(Length::Fill),
-            );
         }
         if let Some(status) = &self.status {
             page = page.push(
