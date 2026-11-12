@@ -26,6 +26,8 @@ const TAB_WIDTH: usize = 4;
 const SCROLL_SPEED: f32 = 2.1;
 /// Scroll reports this soon after a wheel event predate it and are ignored.
 const WHEEL_ECHO: std::time::Duration = std::time::Duration::from_millis(150);
+/// PageUp / PageDown scroll by this share of the visible document height.
+const PAGE_SCROLL: f32 = 0.75;
 const CLOSE_SIZE: f32 = 24.0;
 const RULER_COLUMN: f32 = 80.0;
 /// Advance width of a monospace glyph, relative to the font size.
@@ -44,6 +46,8 @@ fn main() -> iced::Result {
         .subscription(Rite::subscription)
         .theme(Rite::theme)
         .window_size(Size::new(config.window_width, config.window_height))
+        // Unsaved changes are confirmed before quitting; see `Message::CloseWindow`.
+        .exit_on_close_request(false)
         .default_font(Rite::font_for(&config))
         .run()
 }
@@ -117,11 +121,24 @@ struct Rite {
     search_id: Id,
     /// The find bar is shown while this is `Some`.
     search: Option<String>,
+    /// Waiting for the user to confirm losing unsaved changes.
+    closing: Option<Closing>,
     shift: bool,
     /// When the wheel last moved the view; scroll reports right after it are stale echoes.
     last_wheel: std::time::Instant,
     viewport_h: f32,
     viewport_w: f32,
+    /// Height of the scrolled document area, once the scrollable has reported it.
+    body_h: Option<f32>,
+}
+
+/// What closing with unsaved changes is waiting on.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Closing {
+    /// The tab holding the document with this id.
+    Tab(u64),
+    /// The whole window.
+    Window,
 }
 
 /// Document state saved for undo and redo.
@@ -144,8 +161,11 @@ const UNDO_LIMIT: usize = 200;
 #[derive(Debug, Clone)]
 enum Message {
     Edit(Action),
-    Scrolled(f32),
+    /// The document view's scroll offset and height.
+    Scrolled(f32, f32),
     Wheel(iced::mouse::ScrollDelta),
+    /// PageDown (true) / PageUp (false).
+    Page(bool),
     /// Files to open, from a drop or another `rite` invocation.
     Remote(Vec<PathBuf>, Option<String>),
     Resized(Size),
@@ -157,7 +177,13 @@ enum Message {
     CloseTab(usize),
     /// The unsaved document with this id may be closed.
     CloseConfirmed(u64),
-    Noop,
+    CancelClose,
+    /// The window manager asked to close the window (Alt+F4, title bar button).
+    CloseWindow,
+    /// Quit even though there are unsaved changes.
+    QuitConfirmed,
+    /// Enter pressed outside any input: confirms a pending close.
+    ConfirmKey,
     SwitchTab(usize),
     CycleTab(bool),
     Enter,
@@ -168,7 +194,7 @@ enum Message {
     Undo,
     Redo,
     OpenSearch,
-    CloseSearch,
+    Escape,
     SearchChanged(String),
     SearchNext,
     Shift(bool),
@@ -211,10 +237,12 @@ impl Rite {
             editor_id: Id::new("rite-editor"),
             search_id: Id::new("rite-search"),
             search: None,
+            closing: None,
             shift: false,
             last_wheel: std::time::Instant::now(),
             viewport_h,
             viewport_w,
+            body_h: None,
         };
         (app, Task::none())
     }
@@ -250,19 +278,19 @@ impl Rite {
         (self.viewport_w - self.gutter_w()).max(self.char_px() * 4.0)
     }
 
-    /// Characters that fit on one visual row.
-    fn cols(&self) -> usize {
-        (((self.editor_w() - TEXT_PAD * 2.0) / self.char_px()).floor() as usize).max(1)
-    }
-
     /// Where every line wraps at the current width.
     fn layout(&self) -> Layout {
-        let cols = self.cols();
+        let wrap = Wrap {
+            font: self.font,
+            size: self.size_px(),
+            line_h: self.line_px(),
+            width: self.editor_w() - TEXT_PAD * 2.0,
+        };
         let mut starts = Vec::with_capacity(self.doc.content.line_count() + 1);
         let mut breaks = Vec::with_capacity(self.doc.content.line_count());
         let mut row = 0;
         for l in self.doc.content.lines() {
-            let b = wrap_line(&l.text, cols);
+            let b = wrap_line(&l.text, wrap);
             starts.push(row);
             row += b.len();
             breaks.push(b);
@@ -289,7 +317,8 @@ impl Rite {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             window::resize_events().map(|(_, size)| Message::Resized(size)),
-            iced::event::listen_with(|event, _, _| match event {
+            window::close_requests().map(|_| Message::CloseWindow),
+            iced::event::listen_with(|event, status, _| match event {
                 iced::Event::Window(window::Event::FileDropped(path)) => Some(Message::Remote(vec![path], None)),
                 iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => Some(Message::Shift(m.shift())),
                 iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { modifiers, .. }) => {
@@ -297,7 +326,11 @@ impl Rite {
                 }
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::Shift(false)),
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => match key {
-                    Key::Named(Named::Escape) => Some(Message::CloseSearch),
+                    Key::Named(Named::Escape) => Some(Message::Escape),
+                    // A focused editor or input handles Enter itself.
+                    Key::Named(Named::Enter) if status == iced::event::Status::Ignored => {
+                        Some(Message::ConfirmKey)
+                    }
                     Key::Character(c) if modifiers.command() && c.as_str() == "f" => Some(Message::OpenSearch),
                     _ => None,
                 },
@@ -314,7 +347,7 @@ impl Rite {
                     self.doc.content.perform(action);
                     return Task::none();
                 }
-                if matches!(action, Action::Edit(_)) && self.search.is_some() {
+                if matches!(action, Action::Edit(_)) && (self.search.is_some() || self.closing.is_some()) {
                     return Task::none();
                 }
                 if let Action::Edit(edit) = &action {
@@ -334,7 +367,11 @@ impl Rite {
                 } else {
                     self.doc.last_edit = EditKind::None;
                     self.doc.extras.clear();
+                    let whole = matches!(action, Action::SelectWord | Action::SelectLine);
                     self.doc.content.perform(action);
+                    if whole {
+                        normalize_selection(&mut self.doc.content);
+                    }
                 }
                 return self.reveal_cursor();
             }
@@ -380,15 +417,20 @@ impl Rite {
                 return iced::widget::operation::focus(self.search_id.clone())
                     .chain(iced::widget::operation::select_all(self.search_id.clone()));
             }
-            Message::CloseSearch => {
+            Message::Escape => {
+                if self.closing.take().is_some() {
+                    return Task::none();
+                }
                 if self.search.take().is_some() {
                     return iced::widget::operation::focus(self.editor_id.clone());
                 }
+                self.doc.extras.clear();
             }
             Message::SearchChanged(query) => self.search = Some(query),
             Message::SearchNext => return self.search_next(!self.shift),
             Message::Shift(shift) => self.shift = shift,
-            Message::Scrolled(y) => {
+            Message::Scrolled(y, height) => {
+                self.body_h = Some(height);
                 if self.last_wheel.elapsed() > WHEEL_ECHO {
                     self.doc.offset_y = y;
                 }
@@ -398,17 +440,11 @@ impl Rite {
                     iced::mouse::ScrollDelta::Lines { y, .. } => -y * 60.0 * SCROLL_SPEED,
                     iced::mouse::ScrollDelta::Pixels { y, .. } => -y * SCROLL_SPEED,
                 };
-                self.last_wheel = std::time::Instant::now();
-                if dy != 0.0 {
-                    let rows = self.layout().rows();
-                    let max = (rows as f32 - 1.0) * self.line_px();
-                    let target = (self.doc.offset_y + dy).clamp(0.0, max.max(0.0));
-                    self.doc.offset_y = target;
-                    return iced::widget::operation::scroll_to(
-                        self.scroll_id.clone(),
-                        scrollable::AbsoluteOffset { x: None, y: Some(target) },
-                    );
-                }
+                return self.scroll_by(dy);
+            }
+            Message::Page(down) => {
+                let dy = self.body_h.unwrap_or(self.viewport_h) * PAGE_SCROLL;
+                return self.scroll_by(if down { dy } else { -dy });
             }
             Message::Remote(paths, token) => {
                 let mut tasks: Vec<Task<Message>> = paths.into_iter().map(|p| self.open_path(p)).collect();
@@ -460,8 +496,21 @@ impl Rite {
             }
             Message::NewTab => return self.add_tab(Doc::empty()),
             Message::CloseTab(i) => return self.close_tab(i),
-            Message::Noop => {}
+            Message::CancelClose => self.closing = None,
+            Message::ConfirmKey => match self.closing {
+                Some(Closing::Tab(id)) => return self.update(Message::CloseConfirmed(id)),
+                Some(Closing::Window) => return self.update(Message::QuitConfirmed),
+                None => {}
+            },
+            Message::CloseWindow => {
+                if !self.docs().any(|d| d.dirty) {
+                    return iced::exit();
+                }
+                self.closing = Some(Closing::Window);
+            }
+            Message::QuitConfirmed => return iced::exit(),
             Message::CloseConfirmed(id) => {
+                self.closing = None;
                 let index = (0..self.tabs.len()).find(|&i| {
                     let doc = if i == self.active { &self.doc } else { &self.tabs[i] };
                     doc.id == id
@@ -543,11 +592,7 @@ impl Rite {
         let mut done: Vec<(usize, isize, bool)> = Vec::new();
         for (a, h, primary) in sels {
             let before = total_len(&self.doc.content) as isize;
-            let cursor = Cursor {
-                position: pos_of(&self.doc.content, h),
-                selection: (a != h).then(|| pos_of(&self.doc.content, a)),
-            };
-            self.doc.content.move_to(cursor);
+            place(&mut self.doc.content, a, h);
             edit(&mut self.doc.content);
             let after = total_len(&self.doc.content) as isize;
             let at = offset_of(&self.doc.content, self.doc.content.cursor().position);
@@ -564,8 +609,7 @@ impl Rite {
         }
         for (at, primary) in finals {
             if primary {
-                let position = pos_of(&self.doc.content, at);
-                self.doc.content.move_to(Cursor { position, selection: None });
+                place(&mut self.doc.content, at, at);
             } else {
                 self.doc.extras.push((at, at));
             }
@@ -639,7 +683,7 @@ impl Rite {
         let lh = self.line_px();
         let layout = self.layout();
         let max = (layout.rows() as f32 - 1.0) * lh;
-        let row = layout.at(line, m.start).0;
+        let row = layout.at(line, m.col).0;
         let target = (row as f32 * lh + lh / 2.0 - self.viewport_h / 2.0).clamp(0.0, max.max(0.0));
         self.doc.offset_y = target;
         iced::widget::operation::scroll_to(
@@ -791,6 +835,23 @@ impl Rite {
         self.mark_dirty();
     }
 
+    /// Scrolls the view by `dy` pixels without moving the cursor.
+    fn scroll_by(&mut self, dy: f32) -> Task<Message> {
+        // Scroll reports right after this are stale echoes of the old offset.
+        self.last_wheel = std::time::Instant::now();
+        if dy == 0.0 {
+            return Task::none();
+        }
+        let rows = self.layout().rows();
+        let max = (rows as f32 - 1.0) * self.line_px();
+        let target = (self.doc.offset_y + dy).clamp(0.0, max.max(0.0));
+        self.doc.offset_y = target;
+        iced::widget::operation::scroll_to(
+            self.scroll_id.clone(),
+            scrollable::AbsoluteOffset { x: None, y: Some(target) },
+        )
+    }
+
     /// The editor is laid out at its full size inside a scrollable, so keep
     /// the cursor in view ourselves.
     fn reveal_cursor(&mut self) -> Task<Message> {
@@ -871,25 +932,57 @@ impl Rite {
         if !doc.dirty {
             return self.force_close_tab(index);
         }
-        let id = doc.id;
-        let description = format!("\"{}\" has unsaved changes. Closing it will lose them.", doc.name());
-        Task::perform(
-            async move {
-                rfd::AsyncMessageDialog::new()
-                    .set_title("Unsaved changes")
-                    .set_description(description)
-                    .set_level(rfd::MessageLevel::Warning)
-                    .set_buttons(rfd::MessageButtons::OkCancelCustom("Close and lose changes".into(), "Cancel".into()))
-                    .show()
-                    .await
-            },
-            move |result| match result {
-                rfd::MessageDialogResult::Custom(label) if label == "Close and lose changes" => {
-                    Message::CloseConfirmed(id)
-                }
-                rfd::MessageDialogResult::Ok => Message::CloseConfirmed(id),
-                _ => Message::Noop,
-            },
+        self.closing = Some(Closing::Tab(doc.id));
+        Task::none()
+    }
+
+    /// Every open document; the active one comes first.
+    fn docs(&self) -> impl Iterator<Item = &Doc> {
+        std::iter::once(&self.doc)
+            .chain(self.tabs.iter().enumerate().filter(|&(i, _)| i != self.active).map(|(_, d)| d))
+    }
+
+    /// The bar asking whether to close what `self.closing` names and lose its unsaved changes.
+    fn close_bar(&self) -> Option<Element<'_, Message>> {
+        let (prompt, label, confirm) = match self.closing? {
+            Closing::Tab(id) => {
+                let doc = self.docs().find(|d| d.id == id)?;
+                let prompt = format!("\"{}\" has unsaved changes. Closing it will lose them.", doc.name());
+                (prompt, "Close without saving", Message::CloseConfirmed(id))
+            }
+            Closing::Window => {
+                let dirty: Vec<String> = self.docs().filter(|d| d.dirty).map(|d| d.name()).collect();
+                let prompt = match dirty.as_slice() {
+                    [name] => format!("\"{name}\" has unsaved changes. Quitting will lose them."),
+                    names => format!("{} files have unsaved changes. Quitting will lose them.", names.len()),
+                };
+                (prompt, "Quit without saving", Message::QuitConfirmed)
+            }
+        };
+        let p = self.palette;
+        let button = |label: &'static str, message: Message, hover: Color| {
+            iced::widget::button(text(label).size(13))
+                .padding([3, 10])
+                .on_press(message)
+                .style(move |_, status| bar_button_style(p, hover, status))
+        };
+        Some(
+            container(
+                row![
+                    text(prompt).size(13).width(Length::Fill),
+                    button(label, confirm, Color::from_rgb8(0xe0, 0x3e, 0x3e)),
+                    button("Cancel", Message::CancelClose, Color::WHITE),
+                ]
+                .spacing(8)
+                .align_y(alignment::Vertical::Center),
+            )
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.3))),
+                ..Default::default()
+            })
+            .into(),
         )
     }
 
@@ -1046,6 +1139,7 @@ impl Rite {
         let selecting = self.doc.content.selection().is_some();
         let close_index = self.active;
         let searching = self.search.is_some();
+        let closing = self.closing.is_some();
         let editor = text_editor_widget(&self.doc.content)
             .font(self.font)
             .size(size)
@@ -1093,15 +1187,19 @@ impl Rite {
                     (Key::Named(Named::Tab), false) => Some(Binding::Sequence(
                         (0..TAB_WIDTH).map(|_| Binding::Insert(' ')).collect(),
                     )),
-                    (Key::Named(Named::PageDown), false) => Some(Binding::Move(Motion::PageDown)),
-                    (Key::Named(Named::PageUp), false) => Some(Binding::Move(Motion::PageUp)),
+                    // Page motions in the editor would jump to the document's ends
+                    // (its height is unbounded), so these only scroll the view.
+                    (Key::Named(Named::PageDown), _) => Some(Binding::Custom(Message::Page(true))),
+                    (Key::Named(Named::PageUp), _) => Some(Binding::Custom(Message::Page(false))),
                     _ => Binding::from_key_press(press),
                 };
-                if !searching {
+                if !searching && !closing {
                     return binding;
                 }
-                // The find bar is open: navigation and tab commands only, no editing.
+                // A bar is open: navigation and tab commands only, no editing.
+                // Enter answers the close confirmation first, then the find bar.
                 match binding {
+                    Some(Binding::Custom(Message::Enter)) if closing => Some(Binding::Custom(Message::ConfirmKey)),
                     Some(Binding::Custom(Message::Enter)) => Some(Binding::Custom(Message::SearchNext)),
                     Some(
                         b @ (Binding::Move(_)
@@ -1120,6 +1218,7 @@ impl Rite {
                             | Message::CloseTab(_)
                             | Message::SwitchTab(_)
                             | Message::CycleTab(_)
+                            | Message::Page(_)
                             | Message::OpenSearch,
                         ),
                     ) => Some(b),
@@ -1211,7 +1310,7 @@ impl Rite {
             iced::widget::mouse_area(row![gutter, stack![editor, overlay]]).on_scroll(Message::Wheel),
         )
             .id(self.scroll_id.clone())
-            .on_scroll(|v| Message::Scrolled(v.absolute_offset().y))
+            .on_scroll(|v| Message::Scrolled(v.absolute_offset().y, v.bounds().height))
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -1243,6 +1342,9 @@ impl Rite {
                     ..Default::default()
                 }),
             );
+        }
+        if let Some(bar) = self.close_bar() {
+            page = page.push(bar);
         }
         if let Some(status) = &self.status {
             page = page.push(
@@ -1293,41 +1395,67 @@ impl Layout {
     }
 }
 
-/// Character columns at which each visual row of `text` begins. Mirrors word
-/// wrapping: a word that doesn't fit moves whole to the next row, one longer
-/// than a row is broken, and spaces after a word may hang past the edge.
-fn wrap_line(text: &str, cols: usize) -> Vec<usize> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut breaks = vec![0];
-    let mut used = 0;
-    let mut i = 0;
-    while i < chars.len() {
-        let start = i;
-        while i < chars.len() && chars[i] != ' ' {
-            i += 1;
+/// What decides where the editor wraps a line.
+#[derive(Clone, Copy, PartialEq)]
+struct Wrap {
+    font: Font,
+    size: f32,
+    line_h: f32,
+    /// Width available to the text, in pixels.
+    width: f32,
+}
+
+/// Wrapped lines are cached by their text; the cache is dropped when it grows past this.
+const WRAP_CACHE_LIMIT: usize = 100_000;
+
+struct WrapCache {
+    wrap: Option<Wrap>,
+    buffer: Option<iced::advanced::graphics::text::cosmic_text::Buffer>,
+    lines: std::collections::HashMap<String, Vec<usize>>,
+}
+
+thread_local! {
+    static WRAP_CACHE: std::cell::RefCell<WrapCache> = std::cell::RefCell::new(WrapCache {
+        wrap: None,
+        buffer: None,
+        lines: std::collections::HashMap::new(),
+    });
+}
+
+/// Character columns at which each visual row of `text` begins. The line is
+/// laid out by the same text engine and settings as the editor, so line
+/// breaking rules (after `-`, `/`, ...) and hanging spaces match exactly.
+fn wrap_line(text: &str, wrap: Wrap) -> Vec<usize> {
+    use iced::advanced::graphics::text::{cosmic_text, font_system, to_attributes};
+    WRAP_CACHE.with_borrow_mut(|cache| {
+        if cache.wrap != Some(wrap) || cache.lines.len() > WRAP_CACHE_LIMIT {
+            cache.lines.clear();
+            cache.buffer = None;
+            cache.wrap = Some(wrap);
         }
-        let word = i - start;
-        while i < chars.len() && chars[i] == ' ' {
-            i += 1;
+        if let Some(b) = cache.lines.get(text) {
+            return b.clone();
         }
-        let spaces = i - start - word;
-        if used + word > cols && used > 0 {
-            breaks.push(start);
-            used = 0;
-        }
-        if word > cols {
-            let mut at = start + cols;
-            while at < start + word {
-                breaks.push(at);
-                at += cols;
+
+        let mut fs = font_system().write().expect("font system");
+        let fs = fs.raw();
+        let buffer = cache.buffer.get_or_insert_with(|| {
+            let mut b = cosmic_text::Buffer::new(fs, cosmic_text::Metrics::new(wrap.size, wrap.line_h));
+            b.set_wrap(fs, cosmic_text::Wrap::WordOrGlyph);
+            b.set_size(fs, Some(wrap.width), None);
+            b
+        });
+        buffer.set_text(fs, text, &to_attributes(wrap.font), cosmic_text::Shaping::Advanced, None);
+        buffer.shape_until_scroll(fs, false);
+        let mut breaks = vec![0];
+        for run in buffer.layout_runs().skip(1) {
+            if let Some(byte) = run.glyphs.iter().map(|g| g.start).min() {
+                breaks.push(text.get(..byte).map_or(0, |t| t.chars().count()));
             }
-            used = (start + word) - breaks[breaks.len() - 1];
-        } else {
-            used += word;
         }
-        used += spaces;
-    }
-    breaks
+        cache.lines.insert(text.to_string(), breaks.clone());
+        breaks
+    })
 }
 
 /// Case-insensitive comparison form of `s`, one folded char per input char.
@@ -1417,6 +1545,44 @@ fn pos_of(content: &Content, offset: usize) -> Position {
         last = Position { line: i, column: len };
     }
     last
+}
+
+/// Puts the cursor at `head`, selecting back to `anchor` when they differ.
+/// A bare `move_to` without a selection keeps whatever was selected before.
+fn place(content: &mut Content, anchor: usize, head: usize) {
+    let position = pos_of(content, head);
+    if anchor != head {
+        let selection = Some(pos_of(content, anchor));
+        content.move_to(Cursor { position, selection });
+        return;
+    }
+    // Moving with an (empty) selection drops it and leaves the cursor in place.
+    content.move_to(Cursor { position, selection: Some(position) });
+    content.perform(Action::Move(Motion::Left));
+}
+
+/// Word and line selections (double and triple click) report the click point
+/// as both of their ends; turn them into a plain selection of what they cover.
+fn normalize_selection(content: &mut Content) {
+    let cur = content.cursor();
+    let (Some(anchor), Some(text)) = (cur.selection, content.selection()) else {
+        return;
+    };
+    let backwards = (cur.position.line, cur.position.column) < (anchor.line, anchor.column);
+    // With a selection, moving left lands on its start.
+    content.perform(Action::Move(Motion::Left));
+    if text.is_empty() {
+        return;
+    }
+    let start = content.cursor().position;
+    let rows = text.matches('\n').count();
+    let tail = text.rsplit('\n').next().unwrap_or("").len();
+    let end = Position {
+        line: start.line + rows,
+        column: if rows == 0 { start.column + tail } else { tail },
+    };
+    let (position, selection) = if backwards { (start, end) } else { (end, start) };
+    content.move_to(Cursor { position, selection: Some(selection) });
 }
 
 fn total_len(content: &Content) -> usize {
@@ -1652,6 +1818,18 @@ fn tab_style(p: Palette, active: bool) -> iced::widget::button::Style {
         background: None,
         text_color: if active { p.foreground } else { p.gutter },
         border: iced::Border::default(),
+        ..Default::default()
+    }
+}
+
+/// An outlined bar button that fills with `hover` while hovered.
+fn bar_button_style(p: Palette, hover: Color, status: iced::widget::button::Status) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    let hovered = matches!(status, Status::Hovered | Status::Pressed);
+    iced::widget::button::Style {
+        background: hovered.then_some(iced::Background::Color(hover)),
+        text_color: if hovered { Color::BLACK } else { p.foreground },
+        border: iced::Border { radius: 4.0.into(), width: 1.0, color: p.gutter },
         ..Default::default()
     }
 }
