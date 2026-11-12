@@ -29,6 +29,9 @@ const WHEEL_ECHO: std::time::Duration = std::time::Duration::from_millis(150);
 /// PageUp / PageDown scroll by this share of the visible document height.
 const PAGE_SCROLL: f32 = 0.75;
 const CLOSE_SIZE: f32 = 24.0;
+/// How long "saved" stays up after a save.
+const SAVED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+const DIM_GREY: Color = Color::from_rgb8(0x55, 0x55, 0x55);
 const RULER_COLUMN: f32 = 80.0;
 /// Advance width of a monospace glyph, relative to the font size.
 const CHAR_WIDTH: f32 = 0.6;
@@ -110,6 +113,8 @@ struct Rite {
     tabs: Vec<Doc>,
     active: usize,
     status: Option<String>,
+    /// When "saved" was last shown; it hides itself `SAVED_FOR` later.
+    saved_at: Option<std::time::Instant>,
     config: Config,
     font: Font,
     palette: Palette,
@@ -168,6 +173,8 @@ enum Message {
     Resized(Size),
     Save,
     SaveDialog(Option<PathBuf>),
+    /// Hides "saved" once it has been shown for `SAVED_FOR`.
+    HideSaved,
     Open,
     Opened(Option<PathBuf>),
     NewTab,
@@ -227,6 +234,7 @@ impl Rite {
             tabs,
             active: 0,
             status,
+            saved_at: None,
             config,
             palette,
             scroll_id: Id::new("rite-scroll"),
@@ -240,7 +248,8 @@ impl Rite {
             viewport_w,
             body_h: None,
         };
-        (app, Task::none())
+        let focus = iced::widget::operation::focus(app.editor_id.clone());
+        (app, focus)
     }
 
     fn title(&self) -> String {
@@ -392,6 +401,7 @@ impl Rite {
                 return self.reveal_cursor();
             }
             Message::OpenSearch => {
+                self.saved_at = None;
                 // Start from the selected text, if it is a single line.
                 if let Some(sel) = self.doc.content.selection().filter(|s| !s.is_empty() && !s.contains('\n')) {
                     self.search = Some(sel);
@@ -410,7 +420,12 @@ impl Rite {
                 }
             }
             Message::SearchChanged(query) => self.search = Some(query),
-            Message::SearchNext => return self.search_next(!self.shift),
+            // Keep the find input focused, also after its button is clicked.
+            Message::SearchNext => {
+                return self
+                    .search_next(!self.shift)
+                    .chain(iced::widget::operation::focus(self.search_id.clone()));
+            }
             Message::Shift(shift) => self.shift = shift,
             Message::Scrolled(y, height) => {
                 self.body_h = Some(height);
@@ -490,6 +505,12 @@ impl Rite {
                     return iced::exit();
                 }
                 self.closing = Some(Closing::Window);
+                self.saved_at = None;
+            }
+            Message::HideSaved => {
+                if self.saved_at.is_some_and(|t| t.elapsed() >= SAVED_FOR) {
+                    self.saved_at = None;
+                }
             }
             Message::QuitConfirmed => return iced::exit(),
             Message::CloseConfirmed(id) => {
@@ -551,6 +572,7 @@ impl Rite {
     fn mark_dirty(&mut self) {
         self.doc.dirty = true;
         self.status = None;
+        self.saved_at = None;
     }
 
     /// Enter / Shift+Enter in the find bar: select the next or previous match
@@ -790,21 +812,38 @@ impl Rite {
         match std::fs::write(path, text) {
             Ok(()) => {
                 self.doc.dirty = false;
-                self.status = Some("saved".into());
+                self.status = None;
+                self.saved_at = Some(std::time::Instant::now());
+                return Task::perform(
+                    async {
+                        let (tx, rx) = iced::futures::channel::oneshot::channel();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(SAVED_FOR);
+                            let _ = tx.send(());
+                        });
+                        let _ = rx.await;
+                    },
+                    |_| Message::HideSaved,
+                );
             }
             Err(e) => {
                 eprintln!("rite: cannot write {}: {e}", path.display());
+                self.saved_at = None;
                 self.status = Some(format!("save failed: {e}"));
             }
         }
         Task::none()
     }
 
-    fn scroll_to_saved(&self) -> Task<Message> {
-        iced::widget::operation::scroll_to(
-            self.scroll_id.clone(),
-            scrollable::AbsoluteOffset { x: None, y: Some(self.doc.offset_y) },
-        )
+    /// Restores the active document's scroll position and focuses the editor for typing.
+    fn show_doc(&self) -> Task<Message> {
+        Task::batch([
+            iced::widget::operation::scroll_to(
+                self.scroll_id.clone(),
+                scrollable::AbsoluteOffset { x: None, y: Some(self.doc.offset_y) },
+            ),
+            iced::widget::operation::focus(self.editor_id.clone()),
+        ])
     }
 
     fn switch_to(&mut self, index: usize) -> Task<Message> {
@@ -814,7 +853,7 @@ impl Rite {
         std::mem::swap(&mut self.doc, &mut self.tabs[self.active]);
         self.active = index;
         std::mem::swap(&mut self.doc, &mut self.tabs[self.active]);
-        self.scroll_to_saved()
+        self.show_doc()
     }
 
     fn add_tab(&mut self, doc: Doc) -> Task<Message> {
@@ -831,6 +870,7 @@ impl Rite {
             return self.force_close_tab(index);
         }
         self.closing = Some(Closing::Tab(doc.id));
+        self.saved_at = None;
         Task::none()
     }
 
@@ -857,24 +897,23 @@ impl Rite {
                 (prompt, "Quit without saving", Message::QuitConfirmed)
             }
         };
-        let p = self.palette;
-        let button = |label: &'static str, message: Message, hover: Color| {
+        let button = |label: &'static str, message: Message, fill: Color, label_color: Color| {
             iced::widget::button(text(label).size(13))
-                .padding([3, 10])
+                .padding([5, 10])
                 .on_press(message)
-                .style(move |_, status| bar_button_style(p, hover, status))
+                .style(move |_, status| bar_button_style(fill, label_color, status))
         };
         Some(
             container(
                 row![
                     text(prompt).size(13).width(Length::Fill),
-                    button(label, confirm, Color::from_rgb8(0xe0, 0x3e, 0x3e)),
-                    button("Cancel", Message::CancelClose, Color::WHITE),
+                    button(label, confirm, Color::from_rgb8(0xe0, 0x3e, 0x3e), Color::BLACK),
+                    button("Cancel", Message::CancelClose, DIM_GREY, Color::WHITE),
                 ]
                 .spacing(8)
                 .align_y(alignment::Vertical::Center),
             )
-            .padding([4, 8])
+            .padding([8, 8])
             .width(Length::Fill)
             .style(|_| container::Style {
                 background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.3))),
@@ -890,13 +929,13 @@ impl Rite {
         }
         if self.tabs.len() == 1 {
             self.doc = Doc::empty();
-            return self.scroll_to_saved();
+            return self.show_doc();
         }
         if index == self.active {
             self.tabs.remove(index);
             self.active = index.min(self.tabs.len() - 1);
             std::mem::swap(&mut self.doc, &mut self.tabs[self.active]);
-            return self.scroll_to_saved();
+            return self.show_doc();
         }
         self.tabs.remove(index);
         if index < self.active {
@@ -918,7 +957,7 @@ impl Rite {
         // Reuse an untouched untitled tab instead of leaving it behind.
         if self.doc.path.is_none() && !self.doc.dirty && self.doc.content.is_empty() {
             self.doc = doc;
-            return self.scroll_to_saved();
+            return self.show_doc();
         }
         self.add_tab(doc)
     }
@@ -975,7 +1014,7 @@ impl Rite {
         .on_press(Message::NewTab)
         .style(move |_, status| round_hover_style(tab_style(p, false), Color::WHITE, status));
 
-        container(
+        let bar = container(
             row![tabs, plus]
                 .spacing(8)
                 .align_y(alignment::Vertical::Center),
@@ -985,8 +1024,9 @@ impl Rite {
         .style(|_| container::Style {
             background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.3))),
             ..Default::default()
-        })
-        .into()
+        });
+        // The tab buttons capture their own clicks, so only empty space gets here.
+        iced::widget::mouse_area(bar).on_double_click(Message::NewTab).into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1201,26 +1241,28 @@ impl Rite {
 
         let mut page = iced::widget::column![self.tab_bar(), body];
         if let Some(query) = &self.search {
-            let count = if query.is_empty() {
-                String::new()
-            } else {
-                format!("{found_total} found")
-            };
+            let mut find = row![
+                text_input("Find", query)
+                    .id(self.search_id.clone())
+                    .on_input(Message::SearchChanged)
+                    .on_submit(Message::SearchNext)
+                    .size(13)
+                    .padding([5, 6]),
+            ]
+            .spacing(8)
+            .align_y(alignment::Vertical::Center);
+            if !query.is_empty() {
+                find = find.push(text(format!("{found_total} found")).size(12).color(p.gutter));
+            }
+            find = find.push(
+                iced::widget::button(canvas(SearchIcon(Color::WHITE)).width(16).height(BAR_LINE_H))
+                    .padding([5, 10])
+                    .on_press(Message::SearchNext)
+                    .style(|_, status| bar_button_style(DIM_GREY, Color::WHITE, status)),
+            );
             page = page.push(
-                container(
-                    row![
-                        text_input("Find", query)
-                            .id(self.search_id.clone())
-                            .on_input(Message::SearchChanged)
-                            .on_submit(Message::SearchNext)
-                            .size(13)
-                            .padding(4),
-                        text(count).size(12).color(p.gutter).width(80),
-                    ]
-                    .spacing(8)
-                    .align_y(alignment::Vertical::Center),
-                )
-                .padding([4, 8])
+                container(find)
+                .padding([8, 8])
                 .width(Length::Fill)
                 .style(|_| container::Style {
                     background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.3))),
@@ -1230,6 +1272,21 @@ impl Rite {
         }
         if let Some(bar) = self.close_bar() {
             page = page.push(bar);
+        }
+        if self.saved_at.is_some() && self.search.is_none() && self.closing.is_none() {
+            page = page.push(
+                container(
+                    container(text("saved").size(12).color(Color::from_rgb8(0x5f, 0xd0, 0x6a)))
+                        .padding([2, 10])
+                        .style(|_| container::Style {
+                            background: Some(iced::Background::Color(DIM_GREY)),
+                            border: iced::Border { radius: 999.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }),
+                )
+                .padding([4, 8])
+                .width(Length::Fill),
+            );
         }
         if let Some(status) = &self.status {
             page = page.push(
@@ -1444,8 +1501,16 @@ fn closer(open: char) -> Option<char> {
 }
 
 /// Types a character, auto-closing pairs and typing over an existing closer.
+/// A quote typed over a selection wraps it instead of replacing it.
 fn insert_char(content: &mut Content, c: char) {
     let cursor = content.cursor();
+    if matches!(c, '"' | '\'' | '`')
+        && let Some(anchor) = cursor.selection
+        && let Some(sel) = content.selection().filter(|s| !s.is_empty())
+    {
+        wrap_selection(content, c, anchor, cursor.position, &sel);
+        return;
+    }
     let pos = cursor.position;
     let line = content.line(pos.line).map(|l| l.text.to_string()).unwrap_or_default();
     let next = line.get(pos.column..).and_then(|r| r.chars().next());
@@ -1469,6 +1534,21 @@ fn insert_char(content: &mut Content, c: char) {
         }
         _ => content.perform(Action::Edit(Edit::Insert(c))),
     }
+}
+
+/// Puts `quote` on both sides of the selected text `sel` and keeps that text selected.
+fn wrap_selection(content: &mut Content, quote: char, anchor: Position, head: Position, sel: &str) {
+    let forward = (anchor.line, anchor.column) <= (head.line, head.column);
+    let lo = if forward { anchor } else { head };
+    content.perform(Action::Edit(Edit::Paste(std::sync::Arc::new(format!("{quote}{sel}{quote}")))));
+
+    let start = Position { line: lo.line, column: lo.column + quote.len_utf8() };
+    let end = match sel.rsplit_once('\n') {
+        Some((before, last)) => Position { line: lo.line + before.matches('\n').count() + 1, column: last.len() },
+        None => Position { line: start.line, column: start.column + sel.len() },
+    };
+    let (position, selection) = if forward { (end, start) } else { (start, end) };
+    content.move_to(Cursor { position, selection: Some(selection) });
 }
 
 /// Ctrl+Backspace: delete the whitespace and the word before the cursor.
@@ -1635,6 +1715,42 @@ impl<M> canvas::Program<M> for Guides {
     }
 }
 
+/// Height of a line of 13px bar text at iced's default 1.3 line height.
+const BAR_LINE_H: f32 = 13.0 * 1.3;
+
+/// A magnifying glass drawn in the given color.
+struct SearchIcon(Color);
+
+impl<M> canvas::Program<M> for SearchIcon {
+    type State = ();
+
+    fn draw(
+        &self,
+        _: &(),
+        renderer: &iced::Renderer,
+        _: &Theme,
+        bounds: iced::Rectangle,
+        _: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let s = bounds.width.min(bounds.height);
+        let top = (bounds.height - s) / 2.0;
+        let r = s * 0.3;
+        let center = iced::Point::new(r + 1.5, top + r + 1.5);
+        let stroke = canvas::Stroke::default().with_color(self.0).with_width(1.6);
+        frame.stroke(&canvas::Path::circle(center, r), stroke);
+        let d = r * std::f32::consts::FRAC_1_SQRT_2;
+        frame.stroke(
+            &canvas::Path::line(
+                iced::Point::new(center.x + d, center.y + d),
+                iced::Point::new(s - 1.5, top + s - 1.5),
+            ),
+            stroke.with_line_cap(canvas::LineCap::Round),
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
 fn tab_style(p: Palette, active: bool) -> iced::widget::button::Style {
     iced::widget::button::Style {
         background: None,
@@ -1644,14 +1760,20 @@ fn tab_style(p: Palette, active: bool) -> iced::widget::button::Style {
     }
 }
 
-/// An outlined bar button that fills with `hover` while hovered.
-fn bar_button_style(p: Palette, hover: Color, status: iced::widget::button::Status) -> iced::widget::button::Style {
+/// A borderless bar button filled with `fill`, a little brighter while hovered.
+fn bar_button_style(fill: Color, text_color: Color, status: iced::widget::button::Status) -> iced::widget::button::Style {
     use iced::widget::button::Status;
-    let hovered = matches!(status, Status::Hovered | Status::Pressed);
+    let lift = if matches!(status, Status::Hovered | Status::Pressed) { 0.08 } else { 0.0 };
+    let background = Color {
+        r: (fill.r + lift).min(1.0),
+        g: (fill.g + lift).min(1.0),
+        b: (fill.b + lift).min(1.0),
+        ..fill
+    };
     iced::widget::button::Style {
-        background: hovered.then_some(iced::Background::Color(hover)),
-        text_color: if hovered { Color::BLACK } else { p.foreground },
-        border: iced::Border { radius: 4.0.into(), width: 1.0, color: p.gutter },
+        background: Some(iced::Background::Color(background)),
+        text_color,
+        border: iced::Border { radius: 4.0.into(), ..Default::default() },
         ..Default::default()
     }
 }
