@@ -247,7 +247,9 @@ impl Rite {
             body_h: None,
         };
         let focus = iced::widget::operation::focus(app.editor_id.clone());
-        (app, focus)
+        // Input serials are recorded from the start, for later self-activation.
+        let track = window::latest().and_then(|id| window::run(id, activation::track).discard());
+        (app, focus.chain(track))
     }
 
     fn title(&self) -> String {
@@ -366,7 +368,16 @@ impl Rite {
                     }
                 } else {
                     self.doc.last_edit = EditKind::None;
-                    self.doc.content.perform(action);
+                    let before = self.doc.content.cursor().position;
+                    self.doc.content.perform(action.clone());
+                    // Down on the last row goes to the end of the line.
+                    if self.doc.content.cursor().position == before {
+                        match action {
+                            Action::Move(Motion::Down) => self.doc.content.perform(Action::Move(Motion::End)),
+                            Action::Select(Motion::Down) => self.doc.content.perform(Action::Select(Motion::End)),
+                            _ => {}
+                        }
+                    }
                 }
                 return self.reveal_cursor();
             }
@@ -443,22 +454,21 @@ impl Rite {
             }
             Message::Remote(paths, token) => {
                 let mut tasks: Vec<Task<Message>> = paths.into_iter().map(|p| self.open_path(p)).collect();
-                if let Some(token) = token {
-                    tasks.push(window::latest().and_then(move |id| {
-                        let token = token.clone();
-                        window::run(id, move |w| activation::activate(w, &token)).discard()
-                    }));
-                }
-                // Un-minimize, and bounce through always-on-top since a plain
-                // focus request is ignored by many window managers. Wayland
-                // ignores focus requests altogether; there the only way in is
-                // an xdg-activation request, which winit sends for attention.
-                tasks.push(window::latest().and_then(|id| {
-                    window::minimize(id, false)
-                        .chain(window::set_level(id, window::Level::AlwaysOnTop))
-                        .chain(window::set_level(id, window::Level::Normal))
-                        .chain(window::gain_focus(id))
-                        .chain(window::request_user_attention(id, Some(window::UserAttention::Critical)))
+                tasks.push(window::latest().and_then(move |id| {
+                    let token = token.clone();
+                    window::run(id, move |w| activation::activate(w, token.as_deref())).then(move |activated| {
+                        if activated {
+                            return Task::none();
+                        }
+                        // Not on Wayland: un-minimize, and bounce through
+                        // always-on-top since a plain focus request is ignored
+                        // by many window managers.
+                        window::minimize(id, false)
+                            .chain(window::set_level(id, window::Level::AlwaysOnTop))
+                            .chain(window::set_level(id, window::Level::Normal))
+                            .chain(window::gain_focus(id))
+                            .chain(window::request_user_attention(id, Some(window::UserAttention::Critical)))
+                    })
                 }));
                 return Task::batch(tasks);
             }
