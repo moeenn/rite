@@ -112,6 +112,18 @@ fn connect(window: &dyn iced::window::Window) -> Option<Tracker> {
     Some(Tracker { conn, queue, state, seat, activation, surface })
 }
 
+/// Drops the second view of the window's connection. Must run before the
+/// window and its display are gone: left to the thread-local destructor, the
+/// drop would reach into the display winit has already freed.
+pub fn untrack() {
+    TRACKER.with_borrow_mut(|tracker| {
+        if let Some(t) = tracker.take() {
+            t.activation.destroy();
+            let _ = t.conn.flush();
+        }
+    });
+}
+
 /// Asks the compositor to focus and raise the window, with the launcher's
 /// token or else one of the window's own. Returns false when it could not ask.
 pub fn activate(window: &dyn iced::window::Window, token: Option<&str>) -> bool {

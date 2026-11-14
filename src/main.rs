@@ -511,11 +511,15 @@ impl Rite {
             },
             Message::CloseWindow => {
                 if !self.docs().any(|d| d.dirty) {
-                    return iced::exit();
+                    return self.update(Message::QuitConfirmed);
                 }
                 self.closing = Some(Closing::Window);
             }
-            Message::QuitConfirmed => return iced::exit(),
+            Message::QuitConfirmed => {
+                // The tracker must go while the window's display is still alive.
+                activation::untrack();
+                return iced::exit();
+            }
             Message::CloseConfirmed(id) => {
                 self.closing = None;
                 let index = (0..self.tabs.len()).find(|&i| {
