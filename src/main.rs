@@ -370,9 +370,11 @@ impl Rite {
                     self.doc.last_edit = EditKind::None;
                     let before = self.doc.content.cursor().position;
                     self.doc.content.perform(action.clone());
-                    // Down on the last row goes to the end of the line.
+                    // Up on the first row goes to the start of the line, Down on the last row to the end.
                     if self.doc.content.cursor().position == before {
                         match action {
+                            Action::Move(Motion::Up) => self.doc.content.perform(Action::Move(Motion::Home)),
+                            Action::Select(Motion::Up) => self.doc.content.perform(Action::Select(Motion::Home)),
                             Action::Move(Motion::Down) => self.doc.content.perform(Action::Move(Motion::End)),
                             Action::Select(Motion::Down) => self.doc.content.perform(Action::Select(Motion::End)),
                             _ => {}
