@@ -29,6 +29,8 @@ const WHEEL_ECHO: std::time::Duration = std::time::Duration::from_millis(150);
 /// PageUp / PageDown scroll by this share of the visible document height.
 const PAGE_SCROLL: f32 = 0.75;
 const CLOSE_SIZE: f32 = 24.0;
+/// Size of a tab's unsaved-changes dot relative to its label.
+const DIRTY_DOT_SCALE: f32 = 0.8;
 const DIM_GREY: Color = Color::from_rgb8(0x55, 0x55, 0x55);
 /// Tab label colour of a document saved since its last edit.
 const SAVED_GREEN: Color = Color::from_rgb8(0x5f, 0xd0, 0x6a);
@@ -62,6 +64,8 @@ struct Doc {
     content: Content,
     path: Option<PathBuf>,
     dirty: bool,
+    /// The text as last opened or saved; undoing back to it clears `dirty`.
+    clean: String,
     /// Saved, with no edits since; its tab label is shown in green.
     saved: bool,
     offset_y: f32,
@@ -73,9 +77,11 @@ struct Doc {
 impl Doc {
     fn empty() -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let content = Content::new();
         Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            content: Content::new(),
+            clean: content.text(),
+            content,
             path: None,
             dirty: false,
             saved: false,
@@ -91,7 +97,10 @@ impl Doc {
         let mut doc = Self::empty();
         let mut error = None;
         match std::fs::read_to_string(&path) {
-            Ok(t) => doc.content = Content::with_text(&t.replace('\t', &" ".repeat(TAB_WIDTH))),
+            Ok(t) => {
+                doc.content = Content::with_text(&t.replace('\t', &" ".repeat(TAB_WIDTH)));
+                doc.clean = doc.content.text();
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 eprintln!("rite: cannot read {}: {e}", path.display());
@@ -122,8 +131,10 @@ struct Rite {
     scroll_id: Id,
     editor_id: Id,
     search_id: Id,
-    /// The find bar is shown while this is `Some`.
-    search: Option<String>,
+    /// The find bar's query; kept while the bar is closed.
+    search: String,
+    /// The find bar is shown.
+    searching: bool,
     /// Waiting for the user to confirm losing unsaved changes.
     closing: Option<Closing>,
     shift: bool,
@@ -238,7 +249,8 @@ impl Rite {
             scroll_id: Id::new("rite-scroll"),
             editor_id: Id::new("rite-editor"),
             search_id: Id::new("rite-search"),
-            search: None,
+            search: String::new(),
+            searching: false,
             closing: None,
             shift: false,
             last_wheel: std::time::Instant::now(),
@@ -352,7 +364,7 @@ impl Rite {
                     self.doc.content.perform(action);
                     return Task::none();
                 }
-                if matches!(action, Action::Edit(_)) && (self.search.is_some() || self.closing.is_some()) {
+                if matches!(action, Action::Edit(_)) && self.closing.is_some() {
                     return Task::none();
                 }
                 if let Action::Edit(edit) = &action {
@@ -414,10 +426,9 @@ impl Rite {
             Message::OpenSearch => {
                 // Start from the selected text, if it is a single line.
                 if let Some(sel) = self.doc.content.selection().filter(|s| !s.is_empty() && !s.contains('\n')) {
-                    self.search = Some(sel);
-                } else {
-                    self.search.get_or_insert_with(String::new);
+                    self.search = sel;
                 }
+                self.searching = true;
                 return iced::widget::operation::focus(self.search_id.clone())
                     .chain(iced::widget::operation::select_all(self.search_id.clone()));
             }
@@ -425,11 +436,11 @@ impl Rite {
                 if self.closing.take().is_some() {
                     return Task::none();
                 }
-                if self.search.take().is_some() {
+                if std::mem::take(&mut self.searching) {
                     return iced::widget::operation::focus(self.editor_id.clone());
                 }
             }
-            Message::SearchChanged(query) => self.search = Some(query),
+            Message::SearchChanged(query) => self.search = query,
             // Keep the find input focused, also after its button is clicked.
             Message::SearchNext => {
                 return self
@@ -573,7 +584,7 @@ impl Rite {
         let selection = (target.anchor != target.head).then(|| pos_of(&self.doc.content, target.anchor));
         self.doc.content.move_to(Cursor { position, selection });
         self.doc.last_edit = EditKind::None;
-        self.doc.dirty = true;
+        self.doc.dirty = target.text != self.doc.clean;
         self.doc.saved = false;
     }
 
@@ -586,7 +597,7 @@ impl Rite {
     /// Enter / Shift+Enter in the find bar: select the next or previous match
     /// relative to the cursor, wrapping around.
     fn search_next(&mut self, forward: bool) -> Task<Message> {
-        let needle = fold(self.search.as_deref().unwrap_or(""));
+        let needle = fold(&self.search);
         if needle.is_empty() {
             return Task::none();
         }
@@ -813,12 +824,14 @@ impl Rite {
                 Message::SaveDialog,
             );
         };
-        let mut text = self.doc.content.text();
+        let clean = self.doc.content.text();
+        let mut text = clean.clone();
         if !text.ends_with('\n') {
             text.push('\n');
         }
         match std::fs::write(path, text) {
             Ok(()) => {
+                self.doc.clean = clean;
                 self.doc.dirty = false;
                 self.doc.saved = true;
                 self.status = None;
@@ -963,9 +976,13 @@ impl Rite {
         for i in 0..self.tabs.len() {
             let doc = if i == self.active { &self.doc } else { &self.tabs[i] };
             let active = i == self.active;
-            let label = format!("{}{}", if doc.dirty { "● " } else { "" }, doc.name());
+            let mut label = iced::widget::Row::new().spacing(4).align_y(alignment::Vertical::Center);
+            if doc.dirty {
+                label = label.push(text("●").size(13.0 * DIRTY_DOT_SCALE));
+            }
+            let label = label.push(text(doc.name()).size(13));
             let saved = doc.saved;
-            let tab = iced::widget::button(text(label).size(13))
+            let tab = iced::widget::button(label)
                 .padding(0)
                 .on_press(Message::SwitchTab(i))
                 .style(move |_, _| {
@@ -985,13 +1002,18 @@ impl Rite {
             .height(CLOSE_SIZE)
             .on_press(Message::CloseTab(i))
             .style(move |_, status| round_hover_style(tab_style(p, active), Color::from_rgb8(0xe0, 0x3e, 0x3e), status));
+            let tab = container(row![tab, close].spacing(10).align_y(alignment::Vertical::Center))
+                .padding(Padding { top: 10.0, right: 4.0, bottom: 10.0, left: 16.0 })
+                .style(move |_| container::Style {
+                    background: active.then(|| iced::Background::Color(p.background)),
+                    ..Default::default()
+                });
+            // Clicks on the padding around the label activate the tab too; the
+            // close button captures its own.
             bar = bar.push(
-                container(row![tab, close].spacing(10).align_y(alignment::Vertical::Center))
-                    .padding(Padding { top: 10.0, right: 4.0, bottom: 10.0, left: 16.0 })
-                    .style(move |_| container::Style {
-                        background: active.then(|| iced::Background::Color(p.background)),
-                        ..Default::default()
-                    }),
+                iced::widget::mouse_area(tab)
+                    .on_press(Message::SwitchTab(i))
+                    .interaction(iced::mouse::Interaction::Pointer),
             );
         }
         let tabs = scrollable(bar)
@@ -1075,7 +1097,6 @@ impl Rite {
         };
         let selecting = self.doc.content.selection().is_some();
         let close_index = self.active;
-        let searching = self.search.is_some();
         let closing = self.closing.is_some();
         let editor = text_editor_widget(&self.doc.content)
             .font(self.font)
@@ -1089,6 +1110,8 @@ impl Rite {
             .width(self.editor_w())
             .on_action(Message::Edit)
             .key_binding(move |press| {
+                // Every key press comes here, also while another input has focus.
+                let focused = matches!(press.status, text_editor::Status::Focused { .. });
                 let binding = match (&press.key, press.modifiers.command()) {
                     (Key::Character(c), true) if c.as_str() == "s" => Some(Binding::Custom(Message::Save)),
                     (Key::Character(c), true) if c.as_str() == "z" && !press.modifiers.shift() => {
@@ -1131,14 +1154,31 @@ impl Rite {
                     (Key::Named(Named::PageUp), _) => Some(Binding::Custom(Message::Page(false))),
                     _ => Binding::from_key_press(press),
                 };
-                if !searching && !closing {
+                let global = |b: &Binding<Message>| {
+                    matches!(
+                        b,
+                        Binding::Custom(
+                            Message::Save
+                                | Message::Open
+                                | Message::NewTab
+                                | Message::CloseTab(_)
+                                | Message::SwitchTab(_)
+                                | Message::CycleTab(_)
+                                | Message::Page(_)
+                                | Message::OpenSearch,
+                        )
+                    )
+                };
+                if !focused {
+                    // Window-wide commands only; the focused input handles the rest.
+                    return binding.filter(global);
+                }
+                if !closing {
                     return binding;
                 }
-                // A bar is open: navigation and tab commands only, no editing.
-                // Enter answers the close confirmation first, then the find bar.
+                // The close bar is open: navigation and tab commands only, no editing.
                 match binding {
-                    Some(Binding::Custom(Message::Enter)) if closing => Some(Binding::Custom(Message::ConfirmKey)),
-                    Some(Binding::Custom(Message::Enter)) => Some(Binding::Custom(Message::SearchNext)),
+                    Some(Binding::Custom(Message::Enter)) => Some(Binding::Custom(Message::ConfirmKey)),
                     Some(
                         b @ (Binding::Move(_)
                         | Binding::Select(_)
@@ -1148,19 +1188,7 @@ impl Rite {
                         | Binding::Copy
                         | Binding::Unfocus),
                     ) => Some(b),
-                    Some(
-                        b @ Binding::Custom(
-                            Message::Save
-                            | Message::Open
-                            | Message::NewTab
-                            | Message::CloseTab(_)
-                            | Message::SwitchTab(_)
-                            | Message::CycleTab(_)
-                            | Message::Page(_)
-                            | Message::OpenSearch,
-                        ),
-                    ) => Some(b),
-                    _ => None,
+                    b => b.filter(global),
                 }
             })
             .highlight_with::<highlight::Syntax>(hl_settings, highlight::format)
@@ -1200,7 +1228,7 @@ impl Rite {
         }
 
         // Every match of the search query.
-        let needle = self.search.as_deref().map(fold).filter(|n| !n.is_empty());
+        let needle = Some(fold(&self.search)).filter(|n| self.searching && !n.is_empty());
         let mut found = Vec::new();
         let mut found_total = 0;
         if let Some(needle) = &needle {
@@ -1220,6 +1248,12 @@ impl Rite {
             indents: fill_indents(&texts)[visible].to_vec(),
             matches,
             found,
+            caret: cur.selection.map(|_| {
+                let col = texts.get(cur.position.line).map_or(0, |t| {
+                    t[..cur.position.column.min(t.len())].chars().count()
+                });
+                (cur.position.line, col)
+            }),
             origin_x: TEXT_PAD,
             char_w: size * CHAR_WIDTH,
             line_h: lh,
@@ -1227,6 +1261,7 @@ impl Rite {
             ruler: Color { a: 0.22, ..p.foreground },
             highlight: Color { a: 0.2, ..p.foreground },
             found_color: Color::from_rgba8(0xf5, 0xc5, 0x42, 0.4),
+            caret_color: p.foreground,
         };
         let overlay = canvas(guides).width(Length::Fill).height(Length::Fill);
 
@@ -1239,7 +1274,8 @@ impl Rite {
             .height(Length::Fill);
 
         let mut page = iced::widget::column![self.tab_bar(), body];
-        if let Some(query) = &self.search {
+        if self.searching {
+            let query = &self.search;
             let mut find = row![
                 text_input("Find", query)
                     .id(self.search_id.clone())
@@ -1609,6 +1645,9 @@ struct Guides {
     matches: Vec<(usize, usize, usize)>,
     /// Search matches, as (line, start column, length) in characters.
     found: Vec<(usize, usize, usize)>,
+    /// The cursor as (line, column in characters), while text is selected;
+    /// the editor itself only draws an unselected cursor.
+    caret: Option<(usize, usize)>,
     origin_x: f32,
     char_w: f32,
     line_h: f32,
@@ -1616,6 +1655,7 @@ struct Guides {
     ruler: Color,
     highlight: Color,
     found_color: Color,
+    caret_color: Color,
 }
 
 impl<M> canvas::Program<M> for Guides {
@@ -1694,6 +1734,15 @@ impl<M> canvas::Program<M> for Guides {
                     self.found_color,
                 );
             }
+        }
+
+        if let Some((line, col)) = self.caret {
+            let (row, x) = self.layout.at(line, col);
+            frame.fill_rectangle(
+                iced::Point::new(col_x(x).floor(), row_y(row)),
+                Size::new(1.0, self.line_h),
+                self.caret_color,
+            );
         }
         vec![frame.into_geometry()]
     }
