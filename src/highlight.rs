@@ -26,6 +26,7 @@ pub enum Lang {
     Toml,
     Yaml,
     Json,
+    Markdown,
 }
 
 /// What the tokenizer needs to know about a language.
@@ -283,6 +284,16 @@ impl Lang {
                 capitalized_types: false,
                 single_quotes: false,
             },
+            // Highlighted by `markdown` instead.
+            Lang::Markdown => Spec {
+                keywords: &[],
+                literals: &[],
+                types: &[],
+                line_comments: &[],
+                block_comments: false,
+                capitalized_types: false,
+                single_quotes: false,
+            },
         }
     }
 }
@@ -318,6 +329,7 @@ fn from_extension(ext: &str) -> Option<Lang> {
         "toml" => Lang::Toml,
         "yaml" | "yml" => Lang::Yaml,
         "json" => Lang::Json,
+        "md" | "markdown" => Lang::Markdown,
         _ => return None,
     })
 }
@@ -380,6 +392,7 @@ impl highlighter::Highlighter for Syntax {
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
         self.line += 1;
         match self.settings.lang {
+            Some(Lang::Markdown) => markdown(line, &self.settings.palette).into_iter(),
             Some(lang) => tokenize(line, &self.settings.palette, &lang.spec()).into_iter(),
             None => Vec::new().into_iter(),
         }
@@ -464,4 +477,95 @@ fn tokenize(line: &str, p: &Palette, spec: &Spec) -> Vec<(Range<usize>, Color)> 
     }
 
     out
+}
+
+/// Markdown, line by line: headings, list markers and rules at the start of
+/// the line, then inline code, bold and italic. Fenced code blocks span
+/// lines, so they are not recognised.
+fn markdown(line: &str, p: &Palette) -> Vec<(Range<usize>, Color)> {
+    let mut out = Vec::new();
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[indent..];
+
+    // `---`, `___`, `***`: three or more of one character, spaces allowed.
+    let rule = rest.trim_end();
+    if let Some(c) = rule.chars().next()
+        && matches!(c, '-' | '_' | '*')
+        && rule.chars().all(|r| r == c || r == ' ')
+        && rule.chars().filter(|r| *r == c).count() >= 3
+    {
+        out.push((indent..indent + rule.len(), p.keyword));
+        return out;
+    }
+
+    // `#` to `######` followed by a space (or nothing) is a heading.
+    let hashes = rest.bytes().take_while(|b| *b == b'#').count();
+    if (1..=6).contains(&hashes) && (rest.len() == hashes || rest[hashes..].starts_with(' ')) {
+        out.push((indent..indent + hashes, p.keyword));
+        out.push((indent + hashes..line.len(), p.type_name));
+        return out;
+    }
+
+    // List markers: `- `, `* `, `+ `, `1. `, with an optional task box.
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let marker = if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+        1
+    } else if digits > 0 && rest[digits..].starts_with(". ") {
+        digits + 1
+    } else {
+        0
+    };
+    let mut start = indent;
+    if marker > 0 {
+        let after = &rest[marker + 1..];
+        let task = ["[ ]", "[x]", "[X]"].iter().any(|t| after.starts_with(t));
+        let len = if task { marker + 4 } else { marker };
+        out.push((indent..indent + len, p.keyword));
+        start = indent + len;
+    }
+
+    inline(line, start, p, &mut out);
+    out
+}
+
+/// `code`, **bold** and *italic* from byte `i` on.
+fn inline(line: &str, mut i: usize, p: &Palette, out: &mut Vec<(Range<usize>, Color)>) {
+    let bytes = line.as_bytes();
+    while i < bytes.len() {
+        let rest = &line[i..];
+        let span = match bytes[i] {
+            // An escaped character is plain text.
+            b'\\' => {
+                i += 1 + rest[1..].chars().next().map_or(0, char::len_utf8);
+                continue;
+            }
+            b'`' => rest[1..].find('`').map(|e| (e + 2, p.string)),
+            b'*' if rest.starts_with("**") => emphasis(rest, "**").map(|e| (e, p.number)),
+            b'*' => emphasis(rest, "*").map(|e| (e, p.type_name)),
+            _ => None,
+        };
+        match span {
+            Some((len, color)) => {
+                out.push((i..i + len, color));
+                i += len;
+            }
+            // Skip a full UTF-8 character, or a whole run of `*`.
+            None if bytes[i] == b'*' => i += rest.bytes().take_while(|b| *b == b'*').count(),
+            None => i += rest.chars().next().map_or(1, char::len_utf8),
+        }
+    }
+}
+
+/// Length of `rest` up to and including the closing `mark`, when `rest`
+/// opens with `mark` and the text inside neither starts nor ends with a space.
+fn emphasis(rest: &str, mark: &str) -> Option<usize> {
+    let inner = &rest[mark.len()..];
+    if inner.starts_with([' ', '*']) || inner.is_empty() {
+        return None;
+    }
+    let end = inner.find(mark)?;
+    if end == 0 || inner[..end].ends_with(' ') {
+        return None;
+    }
+    Some(mark.len() + end + mark.len())
 }

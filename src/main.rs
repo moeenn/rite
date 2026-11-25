@@ -75,6 +75,13 @@ struct Doc {
 }
 
 impl Doc {
+    fn is_markdown(&self) -> bool {
+        self.path
+            .as_deref()
+            .and_then(|p| p.extension())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+    }
+
     fn empty() -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let content = Content::new();
@@ -375,7 +382,10 @@ impl Rite {
                     });
                     self.mark_dirty();
                     match edit {
-                        Edit::Insert(c) => insert_char(&mut self.doc.content, *c),
+                        Edit::Insert(c) => {
+                            let markdown = self.doc.is_markdown();
+                            insert_char(&mut self.doc.content, *c, markdown)
+                        }
                         _ => self.doc.content.perform(action),
                     }
                 } else {
@@ -398,7 +408,8 @@ impl Rite {
             Message::Enter => {
                 self.record(EditKind::Other);
                 self.mark_dirty();
-                enter_with_indent(&mut self.doc.content);
+                let markdown = self.doc.is_markdown();
+                enter_with_indent(&mut self.doc.content, markdown);
                 return self.reveal_cursor();
             }
             Message::DeleteWord => {
@@ -1131,6 +1142,8 @@ impl Rite {
                         Some(Binding::Custom(Message::MoveLine(false)))
                     }
                     (Key::Named(Named::Enter), false) => Some(Binding::Custom(Message::Enter)),
+                    // Escape is handled window-wide; the editor keeps focus (and its cursor).
+                    (Key::Named(Named::Escape), _) => None,
                     (Key::Character(c), _) if press.modifiers.alt() && c.len() == 1 && c.as_bytes()[0] >= b'1' && c.as_bytes()[0] <= b'9' => {
                         Some(Binding::Custom(Message::SwitchTab((c.as_bytes()[0] - b'1') as usize)))
                     }
@@ -1521,10 +1534,11 @@ fn closer(open: char) -> Option<char> {
 }
 
 /// Types a character, auto-closing pairs and typing over an existing closer.
-/// A quote typed over a selection wraps it instead of replacing it.
-fn insert_char(content: &mut Content, c: char) {
+/// A quote typed over a selection wraps it instead of replacing it, as does
+/// `*` in markdown; the text stays selected, so a second `*` makes `**bold**`.
+fn insert_char(content: &mut Content, c: char, markdown: bool) {
     let cursor = content.cursor();
-    if matches!(c, '"' | '\'' | '`')
+    if (matches!(c, '"' | '\'' | '`') || (markdown && c == '*'))
         && let Some(anchor) = cursor.selection
         && let Some(sel) = content.selection().filter(|s| !s.is_empty())
     {
@@ -1559,13 +1573,20 @@ fn insert_char(content: &mut Content, c: char) {
 /// Puts `quote` on both sides of the selected text `sel` and keeps that text selected.
 fn wrap_selection(content: &mut Content, quote: char, anchor: Position, head: Position, sel: &str) {
     let forward = (anchor.line, anchor.column) <= (head.line, head.column);
-    let lo = if forward { anchor } else { head };
     content.perform(Action::Edit(Edit::Paste(std::sync::Arc::new(format!("{quote}{sel}{quote}")))));
 
-    let start = Position { line: lo.line, column: lo.column + quote.len_utf8() };
-    let end = match sel.rsplit_once('\n') {
-        Some((before, last)) => Position { line: lo.line + before.matches('\n').count() + 1, column: last.len() },
-        None => Position { line: start.line, column: start.column + sel.len() },
+    // Locate the wrapped text from the cursor, which now follows the closing
+    // quote. `anchor` and `head` can't be used: a double- or triple-click
+    // selection reports the click point for both, not the selection's ends.
+    let after = content.cursor().position;
+    let end = Position { line: after.line, column: after.column - quote.len_utf8() };
+    let start = match sel.split_once('\n') {
+        Some((first, _)) => {
+            let line = end.line - sel.matches('\n').count();
+            let len = content.line(line).map_or(0, |l| l.text.len());
+            Position { line, column: len - first.len() }
+        }
+        None => Position { line: end.line, column: end.column - sel.len() },
     };
     let (position, selection) = if forward { (end, start) } else { (start, end) };
     content.move_to(Cursor { position, selection: Some(selection) });
@@ -1604,13 +1625,55 @@ fn delete_word(content: &mut Content) {
     }
 }
 
-/// Break the line and keep the indentation of the line being left.
-fn enter_with_indent(content: &mut Content) {
+/// Markdown list marker at the start of `rest` (the line after its
+/// indentation): its length and the marker for the next item. Tasks
+/// (`- [ ]`), bullets (`-`, `*`) and numbers (`1.`) count, each followed by a
+/// space or the line end, so `**bold**` and `---` are not lists.
+fn list_marker(rest: &str) -> Option<(usize, String)> {
+    let ends_at = |n: usize| rest.len() == n || rest[n..].starts_with(' ');
+    if ["- [ ]", "- [x]", "- [X]"].iter().any(|m| rest.starts_with(m)) && ends_at(5) {
+        return Some((5, "- [ ] ".into()));
+    }
+    for bullet in ["-", "*"] {
+        if rest.starts_with(bullet) && ends_at(1) {
+            return Some((1, format!("{bullet} ")));
+        }
+    }
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && rest[digits..].starts_with('.') && ends_at(digits + 1) {
+        return Some((digits + 1, format!("{} ", &rest[..=digits])));
+    }
+    None
+}
+
+/// Break the line and keep the indentation of the line being left. In
+/// markdown, a list item continues with a new item on the next line.
+fn enter_with_indent(content: &mut Content, markdown: bool) {
     let pos = content.cursor().position;
     let indent = content.line(pos.line).map_or(0, |l| {
         let before = l.text.get(..pos.column).unwrap_or(&l.text);
         before.chars().take_while(|c| *c == ' ').count()
     });
+    // The marker must be before the cursor.
+    let item = if markdown {
+        content.line(pos.line).and_then(|l| {
+            let rest = &l.text[indent.min(l.text.len())..];
+            list_marker(rest)
+                .filter(|(len, _)| pos.column >= indent + len)
+                .map(|(len, next)| (next, rest[len..].trim().is_empty()))
+        })
+    } else {
+        None
+    };
+    if let Some((_, true)) = item {
+        // Enter on an empty item ends the list: drop the marker.
+        content.perform(Action::Move(Motion::End));
+        let n = content.line(pos.line).map_or(0, |l| l.text.len() - indent);
+        for _ in 0..n {
+            content.perform(Action::Edit(Edit::Backspace));
+        }
+        return;
+    }
     let between_braces = content.line(pos.line).is_some_and(|l| {
         l.text.get(..pos.column).is_some_and(|b| b.ends_with('{'))
             && l.text.get(pos.column..).is_some_and(|a| a.starts_with('}'))
@@ -1632,6 +1695,11 @@ fn enter_with_indent(content: &mut Content) {
         content.perform(Action::Move(Motion::End));
     } else {
         spaces(content, indent);
+        if let Some((next, _)) = item {
+            for c in next.chars() {
+                content.perform(Action::Edit(Edit::Insert(c)));
+            }
+        }
     }
 }
 
